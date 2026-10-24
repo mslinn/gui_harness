@@ -10,7 +10,7 @@ Gem::Specification.new do |spec|
     GUI automation harness for round-trip testing of real GUI applications.
   END_DESC
   spec.email                 = ['mslinn@mslinn.com']
-  spec.files                 = Dir['.rubocop.yml', 'LICENSE.*', 'Rakefile', '{lib,spec}/**/*', '*.gemspec', '*.md']
+  spec.files                 = Dir['.rubocop.yml', 'LICENSE.*', 'Rakefile', '{assets,lib,spec}/**/*', '*.gemspec', '*.md']
   spec.homepage              = 'https://mslinn.com'
   spec.license               = 'MIT'
   spec.metadata = {

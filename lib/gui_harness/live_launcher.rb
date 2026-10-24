@@ -45,7 +45,7 @@ module GuiHarness
       }
     ].freeze
 
-    SCRIPT = File.read(File.expand_path('live_launcher.ps1', __dir__))
+    SCRIPT = File.read(File.expand_path('../../assets/gui_harness_live_launcher.ps1', __dir__))
 
     Result = Struct.new(:exit_code, :output, :dialog, :dialog_type, :dismiss_action, :log, :loaded, :crashed, keyword_init: true) do
       def success?

@@ -1,0 +1,5 @@
+*.gem
+.bundle/
+coverage/
+spec/examples.txt
+pkg/

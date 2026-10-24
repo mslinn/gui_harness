@@ -10,8 +10,21 @@ require 'tmpdir'
 # the app exposes. The actual window enumeration and UIAutomation inspection live
 # in the PowerShell sidecar so the Ruby API can remain focused on test output and
 # structured results.
+module Log
+  class << self
+    def debug(message)
+      return unless ENV['GUI_HARNESS_DEBUG'] == '1' || ENV['DEBUG'] == '1'
+
+      warn("[gui_harness] #{message}")
+    end
+  end
+end
+
 module GuiHarness
   module LiveLauncher
+    VISIBILITY_LEVELS = %i[normal minimized hidden].freeze
+    INVISIBLE_VISIBILITY_LEVELS = %i[minimized hidden].freeze
+
     DIALOG_RULES = [
       {
         action: { type: 'button', value: 'OK' },
@@ -72,11 +85,36 @@ module GuiHarness
         { type: rule[:type], action: rule[:action].dup }
       end
 
-      def launch(executable, set, log: nil, timeout: 3)
+      def normalize_visibility(visibility)
+        candidate = visibility.to_s.strip.downcase.to_sym
+        return candidate if VISIBILITY_LEVELS.include?(candidate)
+
+        raise ArgumentError, "visibility must be one of: #{VISIBILITY_LEVELS.join(', ')}"
+      end
+
+      def visibility_style(visibility)
+        case normalize_visibility(visibility)
+        when :hidden then 'Hidden'
+        when :minimized then 'Minimized'
+        else 'Normal'
+        end
+      end
+
+      def debug_visibility_message(visibility, executable)
+        level = normalize_visibility(visibility)
+        "Launching GUI app with visibility=#{level} executable=#{executable}"
+      end
+
+      def launch(executable, set, log: nil, timeout: 3, visibility: :normal)
+        level = normalize_visibility(visibility)
+        if INVISIBLE_VISIBILITY_LEVELS.include?(level)
+          Log.debug(debug_visibility_message(level, executable))
+        end
+
         script = write_powershell_live_launcher_script
         args = ['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', windows_path(script),
                 '-Exe', windows_path(executable), '-Set', windows_path(set),
-                '-TimeoutSeconds', timeout.to_s]
+                '-TimeoutSeconds', timeout.to_s, '-Visibility', level.to_s]
         args += ['-Log', windows_path(log)] unless log.nil?
 
         output, status = Open3.capture2e(*args)

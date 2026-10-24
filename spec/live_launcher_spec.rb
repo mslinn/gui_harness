@@ -1,6 +1,7 @@
 # frozen_string_literal: false
 
 require 'spec_helper'
+require 'stringio'
 require 'tempfile'
 
 RSpec.describe GuiHarness::LiveLauncher do
@@ -27,6 +28,58 @@ RSpec.describe GuiHarness::LiveLauncher do
       expect(described_class.classify_dialog('Some unexpected Live window')).to eq(
         { type: :unknown, action: nil }
       )
+    end
+  end
+
+  describe '.visibility_levels' do
+    [%i[normal :success], %i[normal :failure], %i[minimized :success], %i[minimized :failure], %i[hidden :success], %i[hidden :failure]].each do |visibility, status|
+      it "classifies #{status} correctly when visibility=#{visibility}" do
+        output = if status == :success
+                   <<~TEXT
+                     DIALOG: none
+                     DIALOG_TYPE: none
+                     DISMISS_ACTION: none
+                     CRASHED: no
+                     --- LOG ---
+                     Loading document "C:/demo.als"
+                     Begin ExchangeDocument
+                     End ExchangeDocument
+                   TEXT
+                 else
+                   <<~TEXT
+                     DIALOG: Cannot find the file 'C:/missing.txt'. Make sure the path and file name are correct.
+                     DIALOG_TYPE: error
+                     DISMISS_ACTION: button=OK
+                     CRASHED: no
+                     --- LOG ---
+                     Loading document "C:/demo.als"
+                     Begin ExchangeDocument
+                     Error: file not found
+                   TEXT
+                 end
+
+        status_obj = Struct.new(:exitstatus, keyword_init: true).new(exitstatus: 0)
+        result = described_class.send(:parse, output, status_obj)
+
+        if status == :success
+          expect(result.success?).to be(true)
+          expect(result.dialog).to be_nil
+          expect(result.dialog_type).to be_nil
+          expect(result.outcome).to eq(:loaded)
+        else
+          expect(result.success?).to be(false)
+          expect(result.dialog).to include('Cannot find the file')
+          expect(result.dialog_type).to eq(:error)
+          expect(result.dismiss_action).to eq({ type: 'button', value: 'OK' })
+          expect(result.outcome).to eq(:blocked)
+        end
+
+        if %i[minimized hidden].include?(visibility)
+          message = described_class.debug_visibility_message(visibility, 'notepad.exe')
+          expect(message).to include("visibility=#{visibility}")
+          expect(message).to include('notepad.exe')
+        end
+      end
     end
   end
 

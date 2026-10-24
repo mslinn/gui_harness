@@ -13,7 +13,8 @@ param(
   [Parameter(Mandatory=$true)][string]$Exe,
   [Parameter(Mandatory=$true)][string]$Set,
   [string]$Log = '',
-  [int]$TimeoutSeconds = 5
+  [int]$TimeoutSeconds = 5,
+  [ValidateSet('normal','minimized','hidden')][string]$Visibility = 'normal'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -34,6 +35,7 @@ public class Live {
   [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
   [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
   [DllImport("user32.dll")] public static extern bool DestroyWindow(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
 }
 '@
 
@@ -76,6 +78,24 @@ function Cleanup-Notepad() {
   foreach ($notepad in $notepads) {
     try { Stop-Process -Id $notepad.Id -Force -ErrorAction SilentlyContinue } catch {}
   }
+}
+
+function Set-ProcessWindowVisibility([int]$ProcessId, [string]$Visibility) {
+  $mode = switch ($Visibility) {
+    'hidden' { 0 }
+    'minimized' { 2 }
+    default { 1 }
+  }
+
+  [Live]::EnumWindows({
+    param($handle, $lparam)
+    $owner = 0
+    [void][Live]::GetWindowThreadProcessId($handle, [ref]$owner)
+    if ($owner -eq $ProcessId) {
+      [void][Live]::ShowWindow($handle, $mode)
+    }
+    return $true
+  }, [IntPtr]::Zero) | Out-Null
 }
 
 function Read-Log([long]$Start) {
@@ -176,7 +196,13 @@ if ($Log -and (Test-Path $Log)) { $logStart = (Get-Item $Log).Length }
 
 $argumentList = @()
 if ($Set) { $argumentList = @($Set) }
-$process = Start-Process -FilePath $Exe -ArgumentList $argumentList -PassThru
+$windowStyle = switch ($Visibility) {
+  'hidden' { 'Normal' }
+  'minimized' { 'Normal' }
+  default { 'Normal' }
+}
+$process = Start-Process -FilePath $Exe -ArgumentList $argumentList -PassThru -WindowStyle $windowStyle
+if ($Visibility -ne 'normal') { Set-ProcessWindowVisibility $process.Id $Visibility }
 
 $dialog = $null
 $recovered = $false

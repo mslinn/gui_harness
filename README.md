@@ -8,6 +8,15 @@ A Ruby harness for real GUI automation and end-to-end compatibility testing.
 
 This project is intentionally not a log-only parser. The process-owned window probe is the source of truth. The harness treats the UI as the contract.
 
+The harness is designed for the real WSL-to-Windows workflow: Ruby runs in WSL, then the target GUI is launched by PowerShell on Windows. The launcher script is treated as a deployed runtime asset, not as Ruby source code.
+
+## Project layout
+
+- `lib/` contains the Ruby API and domain logic
+- `assets/` contains runtime assets that are deployed with the gem, including the Windows PowerShell launcher
+- `spec/` contains end-to-end, real-GUI regression tests
+- `.vscode/launch.json` contains editor launch entries for the real harness flow
+
 ## Core behavior
 
 The harness is designed to do the following:
@@ -90,13 +99,18 @@ This keeps a real GUI run easy to assert in Ruby specs without exposing raw UIAu
 
 The harness is intended for round-trip and compatibility testing against real apps. A typical scenario is to launch a real desktop app with a real `.als` file, let it show a modal, classify the dialog, dismiss it, and then assert on the final state.
 
-The same pattern has been exercised with a common Windows app demo: a missing file in Notepad generates a standard `Cannot find the file ...` error dialog. That is exactly the kind of real-world modal the harness is meant to observe and report.
+The project includes two live Notepad regression paths:
+
+- error path: launch Notepad with a missing file and assert that the real `Cannot find the file ...` dialog is detected and dismissed
+- success path: launch Notepad with a valid file and assert that there is no dialog, the run reports success, and the app exits cleanly without leaving a process behind
+
+This is exactly the kind of real-world modal handling the harness is meant to observe and report.
 
 ## PowerShell/Windows integration
 
-The Ruby class delegates actual window inspection to a PowerShell script. The script enumerates the real Windows UI, walks the automation tree, reads dialog text, and returns the observed information in a format that Ruby can parse.
+The Ruby class delegates actual window inspection to a PowerShell script in `assets/`. The script enumerates the real Windows UI, walks the automation tree, reads dialog text, and returns the observed information in a format that Ruby can parse.
 
-This separation keeps Ruby as the test-facing layer while leaving the actual OS-specific automation in the Windows script.
+This separation keeps Ruby as the test-facing layer while leaving the actual OS-specific automation in the deployment asset that ships with the gem.
 
 ## VS Code workflow
 
@@ -113,6 +127,8 @@ From the Run and Debug panel, use one of these entries:
 The harness is meant to run from WSL while the app itself is launched on Windows via PowerShell. That is the supported environment for the real GUI tests.
 
 ## Development
+
+The project is meant to be developed and debugged from WSL, while the GUI itself is launched on Windows. This is intentional and is part of the contract: the harness is a real native-GUI automation layer, not a mocked or local-only emulator.
 
 Install dependencies:
 

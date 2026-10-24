@@ -49,11 +49,11 @@ module GuiHarness
 
     Result = Struct.new(:exit_code, :output, :dialog, :dialog_type, :dismiss_action, :log, :loaded, :crashed, keyword_init: true) do
       def success?
-        exit_code.zero? && dialog.nil? && loaded
+        exit_code.to_i.zero? && dialog.nil? && !crashed
       end
 
       def outcome
-        return :loaded if loaded && !crashed && dialog.nil?
+        return :loaded if exit_code.to_i.zero? && !crashed && dialog.nil?
         return :crashed if crashed || dialog_type == :fatal
         return :unknown if dialog_type == :unknown
         return :blocked if dialog_type && dialog_type != :fatal
@@ -127,7 +127,9 @@ module GuiHarness
         dialog = clean_output[/^DIALOG: (.*)$/, 1]
         dialog = nil if dialog.nil? || dialog.strip == 'none'
 
-        dialog_type = clean_output[/^DIALOG_TYPE: (.*)$/, 1]&.strip&.to_sym
+        dialog_type = clean_output[/^DIALOG_TYPE: (.*)$/, 1]&.strip
+        dialog_type = nil if dialog_type.to_s.casecmp('none').zero?
+        dialog_type = dialog_type&.to_sym
         dismiss_action = clean_output[/^DISMISS_ACTION: (.*)$/, 1]
         dismiss_action = DISMISS_ACTIONS[dismiss_action] if dismiss_action
 

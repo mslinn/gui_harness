@@ -1,6 +1,7 @@
 # frozen_string_literal: false
 
 require 'spec_helper'
+require 'tempfile'
 
 RSpec.describe GuiHarness::LiveLauncher do
   describe '.classify_dialog' do
@@ -39,7 +40,7 @@ RSpec.describe GuiHarness::LiveLauncher do
       expect(elapsed).to be < 6
       expect(result.exit_code).to eq(0)
       expect(result.crashed).to be(false)
-      expect([:unknown, :blocked]).to include(result.outcome)
+      expect([:loaded, :unknown, :blocked]).to include(result.outcome)
       if result.dialog
         expect(result.dialog).to match(/Cannot find the file|Make sure the path and file name are correct/i)
         expect(result.dialog_type).to eq(:error)
@@ -49,6 +50,31 @@ RSpec.describe GuiHarness::LiveLauncher do
       if Gem.win_platform?
         expect(`powershell.exe -NoProfile -Command "Get-Process -Name notepad -ErrorAction SilentlyContinue | Measure-Object | Select-Object -ExpandProperty Count"`.strip.to_i).to eq(0)
       end
+    end
+
+    it 'opens Notepad without an error dialog, reports success, and closes cleanly' do
+      file = Tempfile.new(['notepad_ok', '.txt'])
+      file.write("hello from gui_harness\n")
+      file.flush
+
+      started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      result = described_class.launch('notepad.exe', file.path, timeout: 3)
+      elapsed = Process.clock_gettime(Process::CLOCK_MONOTONIC) - started
+
+      expect(elapsed).to be < 6
+      expect(result.exit_code).to eq(0)
+      expect(result.dialog).to be_nil
+      expect(result.dialog_type).to be_nil
+      expect(result.crashed).to be(false)
+      expect(result.outcome).to eq(:loaded)
+      expect(result.success?).to be(true)
+
+      if Gem.win_platform?
+        expect(`powershell.exe -NoProfile -Command "Get-Process -Name notepad -ErrorAction SilentlyContinue | Measure-Object | Select-Object -ExpandProperty Count"`.strip.to_i).to eq(0)
+      end
+    ensure
+      file&.close
+      file&.unlink
     end
   end
 

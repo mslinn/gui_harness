@@ -98,6 +98,20 @@ The Ruby class delegates actual window inspection to a PowerShell script. The sc
 
 This separation keeps Ruby as the test-facing layer while leaving the actual OS-specific automation in the Windows script.
 
+## VS Code workflow
+
+This project includes a small VS Code launch setup for running the real-GUI specs directly from the editor.
+
+### Launch configurations
+
+From the Run and Debug panel, use one of these entries:
+
+- `RSpec: all specs` — runs the whole suite
+- `RSpec: current file` — runs the active spec file
+- `Ruby: quick Notepad probe` — runs the direct WSL-to-Windows dialog probe used during harness debugging
+
+The harness is meant to run from WSL while the app itself is launched on Windows via PowerShell. That is the supported environment for the real GUI tests.
+
 ## Development
 
 Install dependencies:
@@ -110,6 +124,12 @@ Run the test suite:
 
 ```bash
 bundle exec rspec
+```
+
+Run the focused GUI harness spec:
+
+```bash
+bundle exec rspec spec/live_launcher_spec.rb --format documentation
 ```
 
 ## Testing philosophy

@@ -1,0 +1,28 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "RSpec - all",
+      "program": "${workspaceRoot}/binstub/rspec -I ${workspaceRoot}",
+      "request": "launch",
+      "type": "ruby_lsp"
+    },
+    {
+      "name": "RSpec - active spec file only",
+      "program": "binstub/rspec -I ${workspaceRoot} ${file}",
+      "request": "launch",
+      "type": "ruby_lsp"
+    },
+    {
+      "name": "Quick Notepad probe",
+      "program": "ruby -Ilib -e 'require \"gui_harness\"; result = GuiHarness::LiveLauncher.launch(\"notepad.exe\", \"C:/path/that/does/not/exist/notepad-demo.txt\", timeout: 3); pp result.to_h'",
+      "request": "launch",
+      "type": "ruby_lsp"
+    },
+    {
+      "name": "Attach with ruby_lsp",
+      "request": "attach",
+      "type": "ruby_lsp"
+    }
+  ]
+}

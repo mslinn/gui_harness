@@ -3,6 +3,13 @@
 require 'open3'
 require 'tmpdir'
 
+# Real-GUI compatibility harness.
+#
+# The Ruby layer is intentionally thin: it launches a native Windows GUI process,
+# passes the target file to it, and then interprets whatever visible modal window
+# the app exposes. The actual window enumeration and UIAutomation inspection live
+# in the PowerShell sidecar so the Ruby API can remain focused on test output and
+# structured results.
 module GuiHarness
   module LiveLauncher
     DIALOG_RULES = [

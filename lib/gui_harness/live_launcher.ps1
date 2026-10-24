@@ -1,3 +1,14 @@
+<#
+  GUI process probe for real-app compatibility testing.
+
+  This script is the Windows-side implementation of the harness contract:
+  - launch a GUI executable from WSL via PowerShell
+  - retain ownership of the process and its windows
+  - inspect the visible UIAutomation tree for real modal dialogs
+  - classify the dialog from its user-visible text
+  - dismiss the blocking control when possible
+  - terminate the process tree cleanly before returning
+#>
 param(
   [Parameter(Mandatory=$true)][string]$Exe,
   [Parameter(Mandatory=$true)][string]$Set,

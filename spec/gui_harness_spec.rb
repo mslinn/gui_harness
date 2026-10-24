@@ -2,7 +2,7 @@
 
 require 'spec_helper'
 
-RSpec.describe MslinnGemTemplate do
+RSpec.describe GuiHarness do
   it 'has a version constant' do
     expect(described_class::VERSION).to be_a(String)
   end

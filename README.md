@@ -1,20 +1,20 @@
-# mslinn_gem_template
+# gui_harness
 
-This is a reusable Ruby gem template.
+GUI automation harness for launching and observing real desktop apps during integration tests.
 
 ## Purpose
 
-This project provides the standard structure for a Ruby gem used in this workspace:
+This project provides a reusable Ruby layer for working with GUI applications in end-to-end tests, especially desktop apps that need real window inspection and dismissal logic rather than mock-only behavior.
 
-- Gemfile
-- gemspec
-- lib/
-- exe/
-- spec/
-- bin/
-- RuboCop configuration
-- Rake tasks
+## Typical use
 
-## Usage
+- Launch a desktop application under test
+- Enumerate process-owned windows
+- Read visible dialog text and classify modal states
+- Trigger the appropriate dismissal action
+- Record the final result for real integration and round-trip testing
 
-Copy this directory and rename it for a new gem.
+## Development
+
+- `bundle install`
+- `bundle exec rspec`

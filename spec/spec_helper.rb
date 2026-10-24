@@ -1,5 +1,5 @@
 require 'rspec'
-require_relative '../lib/mslinn_gem_template'
+require_relative '../lib/gui_harness'
 
 RSpec.configure do |config|
   config.order = :random

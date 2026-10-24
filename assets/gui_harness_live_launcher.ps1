@@ -57,6 +57,22 @@ function Stop-ProcessTree([int[]]$ProcessIds) {
   }
 }
 
+function Get-ProcessTreeIds([int[]]$ProcessIds) {
+  $seen = New-Object 'System.Collections.Generic.HashSet[int]'
+  $stack = New-Object 'System.Collections.Generic.Stack[int]'
+  foreach ($processId in $ProcessIds) { if ($processId -gt 0) { $stack.Push($processId) } }
+
+  while ($stack.Count -gt 0) {
+    $currentPid = $stack.Pop()
+    if (-not $seen.Add($currentPid)) { continue }
+    foreach ($child in Get-CimInstance Win32_Process -Filter "ParentProcessId = $currentPid" -ErrorAction SilentlyContinue) {
+      $stack.Push([int]$child.ProcessId)
+    }
+  }
+
+  return @($seen)
+}
+
 function Close-VisibleWindowsForPids([int[]]$ProcessIds) {
   $owners = New-Object 'System.Collections.Generic.HashSet[int]'
   foreach ($processId in $ProcessIds) { if ($processId -gt 0) { [void]$owners.Add([int]$processId) } }
@@ -213,8 +229,9 @@ $cleanupPids = @($process.Id)
 try {
   while ((Get-Date) -lt $deadline) {
     Start-Sleep -Milliseconds 200
-    $running = Get-Process -Id $process.Id -ErrorAction SilentlyContinue
-    if ($null -eq $running) { break }
+    $cleanupPids = @(Get-ProcessTreeIds @($process.Id))
+    $running = @($cleanupPids | ForEach-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
+    if ($running.Count -eq 0) { break }
 
     $text = Read-Log $logStart
 
@@ -225,56 +242,58 @@ try {
     if ($text -match 'Exception: Fatal Error') { $crashed = $true }
     if ($text -match 'End ExchangeDocument') { break }
 
-    foreach ($window in Get-Windows $process.Id) {
-      $shown = Get-DialogText $window.Handle
-      if (-not $shown) { continue }
+    foreach ($processId in $cleanupPids) {
+      foreach ($window in Get-Windows $processId) {
+        $shown = Get-DialogText $window.Handle
+        if (-not $shown) { continue }
 
-      $dialogInfo = Get-DialogInfo $shown
-      $dialog = $shown
+        $dialogInfo = Get-DialogInfo $shown
+        $dialog = $shown
 
-      if ($dialogInfo.Type -eq 'fatal') {
-        $crashed = $true
-        if (Click-Button $window.Handle $dialogInfo.Action) { }
-        break
+        if ($dialogInfo.Type -eq 'fatal') {
+          $crashed = $true
+          if (Click-Button $window.Handle $dialogInfo.Action) { }
+          break
+        }
+
+        if ($dialogInfo.Type -eq 'recovery') {
+          if (Click-Button $window.Handle $dialogInfo.Action) {
+            $recovered = $true
+            $dialog = $null
+            break
+          }
+        }
+
+        if ($dialogInfo.Type -eq 'save_changes') {
+          if (Click-Button $window.Handle $dialogInfo.Action) { }
+        }
+
+        if ($dialogInfo.Type -and $dialogInfo.Type -ne 'unknown') { break }
       }
-
-      if ($dialogInfo.Type -eq 'recovery') {
-        if (Click-Button $window.Handle $dialogInfo.Action) { $recovered = $true }
-      }
-
-      if ($dialogInfo.Type -eq 'save_changes') {
-        if (Click-Button $window.Handle $dialogInfo.Action) { }
-      }
-
-      if ($dialogInfo.Type -and $dialogInfo.Type -ne 'unknown') {
-        break
-      }
+      if ($dialog) { break }
     }
 
     if ($dialog) { break }
+    if ($recovered) { continue }
   }
 
-  foreach ($window in Get-Windows $process.Id) {
-    $shown = Get-DialogText $window.Handle
-    if ($shown -and $shown -notmatch 'serious program error|fatal error') {
-      if (Click-Button $window.Handle 'OK') { }
-      elseif (Click-Button $window.Handle 'No') { }
-      elseif (Click-Button $window.Handle 'Yes') { }
+  $cleanupPids = @(Get-ProcessTreeIds @($process.Id))
+  foreach ($processId in $cleanupPids) {
+    foreach ($window in Get-Windows $processId) {
+      $shown = Get-DialogText $window.Handle
+      if ($shown -and $shown -notmatch 'serious program error|fatal error') {
+        if (Click-Button $window.Handle 'OK') { }
+        elseif (Click-Button $window.Handle 'No') { }
+        elseif (Click-Button $window.Handle 'Yes') { }
+      }
     }
   }
 }
 finally {
-  foreach ($child in Get-CimInstance Win32_Process -Filter "ParentProcessId = $process.Id" -ErrorAction SilentlyContinue) {
-    if ($child.ProcessId -gt 0) { $cleanupPids += [int]$child.ProcessId }
-  }
+  $cleanupPids = @(Get-ProcessTreeIds @($process.Id))
   Close-VisibleWindowsForPids $cleanupPids
   Start-Sleep -Milliseconds 250
-  foreach ($processId in @($cleanupPids | Select-Object -Unique)) {
-    if ($processId -gt 0) {
-      try { Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue } catch {}
-    }
-  }
-
+  Stop-ProcessTree @($process.Id)
   Cleanup-Notepad
 }
 

@@ -114,6 +114,12 @@ function Set-ProcessWindowVisibility([int]$ProcessId, [string]$Visibility) {
   }, [IntPtr]::Zero) | Out-Null
 }
 
+function Debug-Log([string]$Message) {
+  if ($env:GUI_HARNESS_DEBUG -eq '1' -or $env:DEBUG -eq '1') {
+    Write-Output "[gui_harness] $Message"
+  }
+}
+
 function Read-Log([long]$Start) {
   if (-not $Log -or -not (Test-Path $Log)) { return '' }
   $stream = [System.IO.File]::Open($Log, 'Open', 'Read', 'ReadWrite')
@@ -230,6 +236,7 @@ try {
   while ((Get-Date) -lt $deadline) {
     Start-Sleep -Milliseconds 200
     $cleanupPids = @(Get-ProcessTreeIds @($process.Id))
+    Debug-Log "process tree: $($cleanupPids -join ',')"
     $running = @($cleanupPids | ForEach-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
     if ($running.Count -eq 0) { break }
 
@@ -243,8 +250,11 @@ try {
     if ($text -match 'End ExchangeDocument') { break }
 
     foreach ($processId in $cleanupPids) {
-      foreach ($window in Get-Windows $processId) {
+      $windows = @(Get-Windows $processId)
+      Debug-Log "visible windows for PID $processId: $($windows.Count)"
+      foreach ($window in $windows) {
         $shown = Get-DialogText $window.Handle
+        Debug-Log "window PID=$processId class=$($window.Class) title=$($window.Title) text=$shown"
         if (-not $shown) { continue }
 
         $dialogInfo = Get-DialogInfo $shown

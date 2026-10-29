@@ -42,6 +42,14 @@ Metrics/ModuleLength:
 Metrics/PerceivedComplexity:
   Max: 15
 
+# The harness examples assert the whole result of a launch: the exit code, the dialog, its
+# classification, and the outcome. Splitting them would assert less of the contract.
+RSpec/ExampleLength:
+  Enabled: false
+
+RSpec/MultipleExpectations:
+  Enabled: false
+
 Style/Documentation:
   Enabled: false
 

@@ -83,7 +83,6 @@ function Close-VisibleWindowsForPids([int[]]$ProcessIds) {
     [void][Live]::GetWindowThreadProcessId($handle, [ref]$owner)
     if ($owners.Contains([int]$owner) -and [Live]::IsWindowVisible($handle)) {
       [void][Live]::PostMessage($handle, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
-      [void][Live]::DestroyWindow($handle)
     }
     return $true
   }, [IntPtr]::Zero) | Out-Null
@@ -116,8 +115,69 @@ function Set-ProcessWindowVisibility([int]$ProcessId, [string]$Visibility) {
 
 function Debug-Log([string]$Message) {
   if ($env:GUI_HARNESS_DEBUG -eq '1' -or $env:DEBUG -eq '1') {
-    Write-Output "[gui_harness] $Message"
+    [Console]::Error.WriteLine("[gui_harness] $Message")
   }
+}
+
+# The virtual key code of a key the harness sends.
+#
+# @param Key the name of the key, e.g. 'n' or 'esc'
+# @return [int] the virtual key code, or 0 when the key is not one of them
+function Get-KeyCode([string]$Key) {
+  switch ($Key.ToUpper()) {
+    'N' { return 0x4E }
+    'Y' { return 0x59 }
+    'ESC' { return 0x1B }
+    '{ESC}' { return 0x1B }
+    'ENTER' { return 0x0D }
+    default { return 0 }
+  }
+}
+
+# Sends a key to the windows of an application.
+#
+# The dialogs of Live are Qt windows, and UI Automation sees nothing in them, so a dialog of Live
+# is read from its log and dismissed with the keyboard. The key is posted to the windows of the
+# application, and not to the foreground window: a modal dialog of Live is a window of Live, but
+# the window that has the focus is not necessarily the dialog.
+#
+# @param ProcessIds the processes the key goes to
+# @param Key the name of the key
+# @return [int] the number of windows the key was sent to
+function Send-KeyToWindows([int[]]$ProcessIds, [string]$Key) {
+  $code = Get-KeyCode $Key
+  if ($code -eq 0) { return 0 }
+
+  $script:sent = 0
+  [Live]::EnumWindows({
+    param($handle, $lparam)
+    $owner = 0
+    [void][Live]::GetWindowThreadProcessId($handle, [ref]$owner)
+    if ($ProcessIds -contains [int]$owner) {
+      [void][Live]::PostMessage($handle, 0x0100, [IntPtr]$code, [IntPtr]::Zero)
+      [void][Live]::PostMessage($handle, 0x0101, [IntPtr]$code, [IntPtr]::Zero)
+      $script:sent++
+    }
+    return $true
+  }, [IntPtr]::Zero) | Out-Null
+
+  Debug-Log "sent $Key to $script:sent windows"
+  return $script:sent
+}
+
+# Brings the app to the foreground and sends it a key.
+#
+# @param ProcessId the process the key goes to
+# @param Key the key, in the notation of WScript.Shell.SendKeys
+# @return $true if the app was brought to the foreground
+function Send-DismissKey([int]$ProcessId, [string]$Key) {
+  $shell = New-Object -ComObject WScript.Shell
+  $activated = $shell.AppActivate($ProcessId)
+  Debug-Log "AppActivate($ProcessId) returned $activated, sending $Key"
+  if (-not $activated) { return $false }
+  Start-Sleep -Milliseconds 200
+  $shell.SendKeys($Key)
+  return $true
 }
 
 function Read-Log([long]$Start) {
@@ -152,18 +212,52 @@ function Get-Windows([int]$ProcessId) {
   return $found
 }
 
-function Get-DialogText([IntPtr]$Handle) {
+function Test-IsModal($Element) {
+  if ($null -eq $Element) { return $false }
+  try {
+    $pattern = $Element.GetCurrentPattern([System.Windows.Automation.WindowPattern]::Pattern)
+    return $pattern.Current.IsModal
+  } catch { return $false }
+}
+
+# Finds the modal dialog of a window.
+#
+# An application is not a dialog. The windows of an application hold the whole of its
+# interface, so the text of a window says nothing about whether the application is blocked.
+# A dialog is a window inside it that is modal, and its own text is the text of the dialog.
+#
+# The dialogs of Live are Qt windows, and UI Automation sees nothing in them, so a dialog of
+# Live is read from its log instead.
+#
+# @param Handle the handle of a window of the application
+# @return the modal dialog, or $null when there is none
+function Get-DialogElement([IntPtr]$Handle) {
   $root = [System.Windows.Automation.AutomationElement]::FromHandle($Handle)
   if ($null -eq $root) { return $null }
+  if (Test-IsModal $root) { return $root }
+
+  $condition = New-Object System.Windows.Automation.PropertyCondition(
+    [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+    [System.Windows.Automation.ControlType]::Window)
+  $windows = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $condition)
+  foreach ($element in $windows) {
+    if (Test-IsModal $element) { return $element }
+  }
+  return $null
+}
+
+function Get-DialogText($Element) {
+  if ($null -eq $Element) { return $null }
 
   $names = [System.Collections.Generic.List[string]]::new()
-  $rootName = $root.Current.Name
+  $rootName = $Element.Current.Name
   if ($rootName -and $rootName.Trim().Length -gt 0) { [void]$names.Add($rootName.Trim()) }
 
-  $all = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants,
-                       [System.Windows.Automation.Condition]::TrueCondition)
+  $all = $Element.FindAll([System.Windows.Automation.TreeScope]::Descendants,
+                           [System.Windows.Automation.Condition]::TrueCondition)
   foreach ($element in $all) {
     $name = $element.Current.Name
+    Debug-Log "  element type=$($element.Current.ControlType.ProgrammaticName) class=$($element.Current.ClassName) name='$name'"
     if ($name -and $name.Trim().Length -gt 0) {
       $trimmed = $name.Trim()
       if (-not $names.Contains($trimmed)) { [void]$names.Add($trimmed) }
@@ -175,16 +269,15 @@ function Get-DialogText([IntPtr]$Handle) {
   return ($text -join ' | ')
 }
 
-function Click-Button([IntPtr]$Handle, [string]$Label) {
-  $root = [System.Windows.Automation.AutomationElement]::FromHandle($Handle)
-  if ($null -eq $root) { return $false }
+function Click-Button($Element, [string]$Label) {
+  if ($null -eq $Element) { return $false }
   $condition = New-Object System.Windows.Automation.AndCondition(
     (New-Object System.Windows.Automation.PropertyCondition(
       [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
       [System.Windows.Automation.ControlType]::Button)),
     (New-Object System.Windows.Automation.PropertyCondition(
       [System.Windows.Automation.AutomationElement]::NameProperty, $Label)))
-  $button = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
+  $button = $Element.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $condition)
   if ($null -eq $button) { return $false }
   try {
     $button.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
@@ -204,6 +297,9 @@ function Get-DialogInfo([string]$Text) {
   }
   if ($normalized -match 'Save changes\?|Do you want to save the changes\?') {
     return [pscustomobject]@{ Type = 'save_changes'; Action = 'No'; ActionType = 'button'; ActionValue = 'No' }
+  }
+  if ($normalized -match 'cannot find the path specified|cannot find the file|make sure the path and file name are correct|the file does not exist') {
+    return [pscustomobject]@{ Type = 'error'; Action = 'OK'; ActionType = 'button'; ActionValue = 'OK' }
   }
 
   return [pscustomobject]@{ Type = 'unknown'; Action = $null; ActionType = $null; ActionValue = $null }
@@ -232,6 +328,11 @@ $crashed = $false
 $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
 $cleanupPids = @($process.Id)
 
+# The keys that dismiss the recovery prompt of Live, in the order they are tried.
+$recoveryKeys = @('n', 'esc')
+$recoveryAttempt = 0
+$recoveryKeySentAt = $null
+
 try {
   while ((Get-Date) -lt $deadline) {
     Start-Sleep -Milliseconds 200
@@ -242,18 +343,43 @@ try {
 
     $text = Read-Log $logStart
 
-    if (-not $dialog -and $text -match 'Message Box: (.*)') {
-      $message = $Matches[1].Trim()
-      if ($message -notmatch 'recover your work') { $dialog = $message }
+    # Live writes the text of its message boxes to its log, and its dialogs are Qt windows that
+    # UI Automation sees nothing in, so the log is where a dialog of Live is read from.
+    $messages = [regex]::Matches($text, 'Message Box: (.*)')
+    if ($messages.Count -gt 0) {
+      $message = $messages[$messages.Count - 1].Groups[1].Value.Trim()
+      if ($message -match 'recover your work') {
+        # The recovery prompt holds the set back: the document is not loaded until it is gone.
+        # The key goes to the windows of Live as soon as the prompt is seen, and again with the
+        # next key when the prompt is still there.
+        if ($recoveryAttempt -lt $recoveryKeys.Count) {
+          $key = $recoveryKeys[$recoveryAttempt]
+          $recoveryAttempt++
+          $recoveryKeySentAt = Get-Date
+          Debug-Log "dismissing the recovery prompt with $key"
+          [void](Send-KeyToWindows $cleanupPids $key)
+        } elseif ($null -ne $recoveryKeySentAt -and
+                  ((Get-Date) - $recoveryKeySentAt).TotalSeconds -ge 1) {
+          # The prompt did not go away. It is the window that has the focus that is dismissed,
+          # so the app is brought to the foreground and the key is sent to it.
+          $recoveryKeySentAt = Get-Date
+          Debug-Log "dismissing the recovery prompt with the foreground"
+          [void](Send-DismissKey $process.Id 'n')
+        }
+      } elseif (-not $dialog) {
+        $dialog = $message
+      }
     }
+    if ($text -match 'Begin ExchangeDocument') { $recovered = $true }
     if ($text -match 'Exception: Fatal Error') { $crashed = $true }
     if ($text -match 'End ExchangeDocument') { break }
 
     foreach ($processId in $cleanupPids) {
       $windows = @(Get-Windows $processId)
-      Debug-Log "visible windows for PID $processId: $($windows.Count)"
+      Debug-Log "visible windows for PID ${processId}: $($windows.Count)"
       foreach ($window in $windows) {
-        $shown = Get-DialogText $window.Handle
+        $dialogElement = Get-DialogElement $window.Handle
+        $shown = Get-DialogText $dialogElement
         Debug-Log "window PID=$processId class=$($window.Class) title=$($window.Title) text=$shown"
         if (-not $shown) { continue }
 
@@ -262,12 +388,12 @@ try {
 
         if ($dialogInfo.Type -eq 'fatal') {
           $crashed = $true
-          if (Click-Button $window.Handle $dialogInfo.Action) { }
+          if (Click-Button $dialogElement $dialogInfo.Action) { }
           break
         }
 
         if ($dialogInfo.Type -eq 'recovery') {
-          if (Click-Button $window.Handle $dialogInfo.Action) {
+          if (Click-Button $dialogElement $dialogInfo.Action) {
             $recovered = $true
             $dialog = $null
             break
@@ -275,7 +401,7 @@ try {
         }
 
         if ($dialogInfo.Type -eq 'save_changes') {
-          if (Click-Button $window.Handle $dialogInfo.Action) { }
+          if (Click-Button $dialogElement $dialogInfo.Action) { }
         }
 
         if ($dialogInfo.Type -and $dialogInfo.Type -ne 'unknown') { break }
@@ -290,11 +416,12 @@ try {
   $cleanupPids = @(Get-ProcessTreeIds @($process.Id))
   foreach ($processId in $cleanupPids) {
     foreach ($window in Get-Windows $processId) {
-      $shown = Get-DialogText $window.Handle
+      $dialogElement = Get-DialogElement $window.Handle
+      $shown = Get-DialogText $dialogElement
       if ($shown -and $shown -notmatch 'serious program error|fatal error') {
-        if (Click-Button $window.Handle 'OK') { }
-        elseif (Click-Button $window.Handle 'No') { }
-        elseif (Click-Button $window.Handle 'Yes') { }
+        if (Click-Button $dialogElement 'OK') { }
+        elseif (Click-Button $dialogElement 'No') { }
+        elseif (Click-Button $dialogElement 'Yes') { }
       }
     }
   }
@@ -302,7 +429,21 @@ try {
 finally {
   $cleanupPids = @(Get-ProcessTreeIds @($process.Id))
   Close-VisibleWindowsForPids $cleanupPids
-  Start-Sleep -Milliseconds 250
+
+  # Live asks whether to save the set when it is closed. The set is a test, so the answer is no.
+  # Live that is closed this way leaves no crash recovery state behind, and the next run starts
+  # without a recovery prompt.
+  $closeDeadline = (Get-Date).AddSeconds(5)
+  while ((Get-Date) -lt $closeDeadline) {
+    $messages = [regex]::Matches((Read-Log $logStart), 'Message Box: (.*)')
+    if ($messages.Count -gt 0 -and $messages[$messages.Count - 1].Groups[1].Value -match 'Save changes') {
+      [void](Send-KeyToWindows @(Get-ProcessTreeIds @($process.Id)) 'n')
+    }
+    $running = @(Get-ProcessTreeIds @($process.Id) | ForEach-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
+    if ($running.Count -eq 0) { break }
+    Start-Sleep -Milliseconds 200
+  }
+
   Stop-ProcessTree @($process.Id)
   Cleanup-Notepad
 }

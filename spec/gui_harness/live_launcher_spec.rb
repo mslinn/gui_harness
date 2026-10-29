@@ -5,6 +5,16 @@ require 'stringio'
 require 'tempfile'
 
 RSpec.describe GuiHarness::LiveLauncher do
+  # The number of Notepad processes Windows is running.
+  #
+  # @return [Integer] the number of them
+  def notepad_process_count
+    command = 'powershell.exe -NoProfile -Command "Get-Process -Name notepad ' \
+              '-ErrorAction SilentlyContinue | Measure-Object | ' \
+              'Select-Object -ExpandProperty Count"'
+    `#{command}`.strip.to_i
+  end
+
   describe '.classify_dialog' do
     it 'recognizes each supported dialog family and the required dismissal action' do
       expect(described_class.classify_dialog('A serious program error has occurred.')).to eq(
@@ -32,7 +42,8 @@ RSpec.describe GuiHarness::LiveLauncher do
   end
 
   describe '.visibility_levels' do
-    [%i[normal :success], %i[normal :failure], %i[minimized :success], %i[minimized :failure], %i[hidden :success], %i[hidden :failure]].each do |visibility, status|
+    [%i[normal success], %i[normal failure], %i[minimized success], %i[minimized failure], %i[hidden success],
+     %i[hidden failure]].each do |visibility, status|
       it "classifies #{status} correctly when visibility=#{visibility}" do
         output = if status == :success
                    <<~TEXT
@@ -93,16 +104,14 @@ RSpec.describe GuiHarness::LiveLauncher do
       expect(elapsed).to be < 6
       expect(result.exit_code).to eq(0)
       expect(result.crashed).to be(false)
-      expect([:loaded, :unknown, :blocked]).to include(result.outcome)
+      expect(result.outcome).to(satisfy { |outcome| %i[loaded unknown blocked].include?(outcome) })
       if result.dialog
-        expect(result.dialog).to match(/Cannot find the file|Make sure the path and file name are correct/i)
+        expect(result.dialog).to match(/cannot find the path specified/i)
         expect(result.dialog_type).to eq(:error)
         expect(result.dismiss_action).to eq({ type: 'button', value: 'OK' })
       end
 
-      if Gem.win_platform?
-        expect(`powershell.exe -NoProfile -Command "Get-Process -Name notepad -ErrorAction SilentlyContinue | Measure-Object | Select-Object -ExpandProperty Count"`.strip.to_i).to eq(0)
-      end
+      expect(notepad_process_count).to eq(0) if Gem.win_platform?
     end
 
     it 'opens Notepad without an error dialog, reports success, and closes cleanly' do
@@ -122,9 +131,7 @@ RSpec.describe GuiHarness::LiveLauncher do
       expect(result.outcome).to eq(:loaded)
       expect(result.success?).to be(true)
 
-      if Gem.win_platform?
-        expect(`powershell.exe -NoProfile -Command "Get-Process -Name notepad -ErrorAction SilentlyContinue | Measure-Object | Select-Object -ExpandProperty Count"`.strip.to_i).to eq(0)
-      end
+      expect(notepad_process_count).to eq(0) if Gem.win_platform?
     ensure
       file&.close
       file&.unlink

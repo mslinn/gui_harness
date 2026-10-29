@@ -63,10 +63,10 @@ puts result.outcome
 The library can also classify a dialog text string directly:
 
 ```ruby
-GuiHarness::LiveLauncher.classify_dialog("A serious program error has occurred.")
+GuiHarness::LiveLauncher.classify_dialog('A serious program error has occurred.')
 # => { type: :fatal, action: { type: "button", value: "OK" } }
 
-GuiHarness::LiveLauncher.classify_dialog("Save changes?")
+GuiHarness::LiveLauncher.classify_dialog('Save changes?')
 # => { type: :save_changes, action: { type: "button", value: "No" } }
 
 GuiHarness::LiveLauncher.classify_dialog("Cannot find the file 'missing.als'. Make sure the path and file name are correct.")

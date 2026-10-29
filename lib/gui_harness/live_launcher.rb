@@ -2,6 +2,7 @@
 
 require 'open3'
 require 'tmpdir'
+require_relative 'log'
 
 # Real-GUI compatibility harness.
 #
@@ -10,16 +11,6 @@ require 'tmpdir'
 # the app exposes. The actual window enumeration and UIAutomation inspection live
 # in the PowerShell sidecar so the Ruby API can remain focused on test output and
 # structured results.
-module Log
-  class << self
-    def debug(message)
-      return unless ENV['GUI_HARNESS_DEBUG'] == '1' || ENV['DEBUG'] == '1'
-
-      warn("[gui_harness] #{message}")
-    end
-  end
-end
-
 module GuiHarness
   module LiveLauncher
     VISIBILITY_LEVELS = %i[normal minimized hidden].freeze
@@ -27,38 +18,45 @@ module GuiHarness
 
     DIALOG_RULES = [
       {
-        action: { type: 'button', value: 'OK' },
-        id: 'fatal',
+        action:  { type: 'button', value: 'OK' },
+        id:      'fatal',
         pattern: /A serious program error has occurred\.|fatal error/i,
-        type: :fatal,
+        type:    :fatal,
       },
       {
-        action: { type: 'button', value: 'No' },
-        id: 'recover',
+        action:  { type: 'button', value: 'No' },
+        id:      'recover',
         pattern: /Would you like to recover your work\?/i,
-        type: :recovery,
+        type:    :recovery,
       },
       {
-        action: { type: 'button', value: 'No' },
-        id: 'save',
+        action:  { type: 'button', value: 'No' },
+        id:      'save',
         pattern: /Save changes\?/i,
-        type: :save_changes,
+        type:    :save_changes,
       },
       {
-        action: { type: 'button', value: 'OK' },
-        id: 'error',
-        pattern: /Cannot find the file|Make sure the path and file name are correct|The file is in use|The file does not exist/i,
-        type: :error,
+        action:  { type: 'button', value: 'OK' },
+        id:      'error',
+        pattern: /Cannot find the file|Make sure the path and file name are correct|The file is in use|
+                  The file does not exist|cannot find the path specified/ix,
+        type:    :error,
       },
       {
-        action: { type: 'button', value: 'OK' },
-        id: 'shutdown',
+        action:  { type: 'button', value: 'OK' },
+        id:      'shutdown',
         pattern: /Live will shut down after this message box is closed\./i,
-        type: :fatal,
+        type:    :fatal,
       }
     ].freeze
 
     SCRIPT = File.read(File.expand_path('../../assets/gui_harness_live_launcher.ps1', __dir__))
+
+    DISMISS_ACTIONS = {
+      'button=OK' => { type: 'button', value: 'OK' },
+      'button=No' => { type: 'button', value: 'No' },
+      'key=n'     => { type: 'key', value: 'n' },
+    }.freeze
 
     Result = Struct.new(:exit_code, :output, :dialog, :dialog_type, :dismiss_action, :log, :loaded, :crashed, keyword_init: true) do
       def success?
@@ -107,9 +105,7 @@ module GuiHarness
 
       def launch(executable, set, log: nil, timeout: 3, visibility: :normal)
         level = normalize_visibility(visibility)
-        if INVISIBLE_VISIBILITY_LEVELS.include?(level)
-          Log.debug(debug_visibility_message(level, executable))
-        end
+        Log.debug(debug_visibility_message(level, executable)) if INVISIBLE_VISIBILITY_LEVELS.include?(level)
 
         script = write_powershell_live_launcher_script
         args = ['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', windows_path(script),
@@ -132,7 +128,7 @@ module GuiHarness
       end
 
       def windows_path(path)
-        return path unless path.start_with?('/');
+        return path unless path.start_with?('/')
 
         out, status = Open3.capture2e 'wslpath', '-w', path
         status.success? ? out.strip : path
@@ -154,12 +150,6 @@ module GuiHarness
         end
       end
 
-      DISMISS_ACTIONS = {
-        'button=OK' => { type: 'button', value: 'OK' },
-        'button=No' => { type: 'button', value: 'No' },
-        'key=n' => { type: 'key', value: 'n' },
-      }.freeze
-
       def parse(output, status)
         clean_output = output.gsub("\r\n", "\n")
         dialog = clean_output[/^DIALOG: (.*)$/, 1]
@@ -179,14 +169,14 @@ module GuiHarness
         log = clean_output[/--- LOG ---\s*(.*)\z/m, 1].to_s
         loaded = log.include?('End ExchangeDocument')
 
-        Result.new(crashed: crashed,
-                   dialog: dialog,
-                   dialog_type: dialog_type,
+        Result.new(crashed:        crashed,
+                   dialog:         dialog,
+                   dialog_type:    dialog_type,
                    dismiss_action: dismiss_action,
-                   exit_code: status.exitstatus,
-                   loaded: loaded,
-                   log: log,
-                   output: clean_output)
+                   exit_code:      status.exitstatus,
+                   loaded:         loaded,
+                   log:            log,
+                   output:         clean_output)
       end
     end
   end

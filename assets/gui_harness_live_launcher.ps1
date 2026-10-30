@@ -1007,26 +1007,6 @@ Close-RunningLive
 Cleanup-Notepad
 Start-Sleep -Milliseconds 250
 
-$argumentList = @()
-if ($Set) { $argumentList = @($Set) }
-$windowStyle = switch ($Visibility) {
-  'hidden' { 'Normal' }
-  'minimized' { 'Normal' }
-  default { 'Normal' }
-}
-$process = Start-Process -FilePath $Exe -ArgumentList $argumentList -PassThru -WindowStyle $windowStyle
-if ($Visibility -ne 'normal') { Set-ProcessWindowVisibility $process.Id $Visibility }
-
-# The pid of the application is written down, so that a run that is cut short from the outside
-# still knows what to stop. A Live that is left running goes on by itself, and it takes the
-# machine over when it checks for package installation.
-if ($PidFile) { Set-Content -Path $PidFile -Value $process.Id -Encoding ascii }
-
-# When the set was written last, so that the write of the application can be told apart from
-# the set that was there before.
-$setWriteTime = [datetime]::MinValue
-if ($Set -and (Test-Path $Set)) { $setWriteTime = (Get-Item $Set).LastWriteTime }
-
 $dialog = $null
 $recovered = $false
 $crashed = $false
@@ -1035,12 +1015,45 @@ $updater = $false
 $lastMessage = $null
 $dismissed = @()
 
+$argumentList = @()
+if ($Set) { $argumentList = @($Set) }
+$windowStyle = switch ($Visibility) {
+  'hidden' { 'Normal' }
+  'minimized' { 'Normal' }
+  default { 'Normal' }
+}
+
+# A permission prompt of the installer of Ableton is on the secure desktop, where nothing of
+# the session can answer it. Live waits for that permission, and every Live that is started
+# while a prompt is waiting leaves another prompt behind. So Live is not started at all while
+# a prompt is waiting, and the run is reported as blocked by the installer.
+$pendingPrompts = @(Get-PermissionPrompts)
+$process = $null
+if (Test-WaitsForPermission $Exe $pendingPrompts) {
+  $updater = $true
+  Debug-Log "a prompt is asking for permission ($($pendingPrompts.Count) of them); Live is not started"
+} else {
+  $process = Start-Process -FilePath $Exe -ArgumentList $argumentList -PassThru -WindowStyle $windowStyle
+  if ($Visibility -ne 'normal') { Set-ProcessWindowVisibility $process.Id $Visibility }
+
+  # The pid of the application is written down, so that a run that is cut short from the outside
+  # still knows what to stop. A Live that is left running goes on by itself, and it takes the
+  # machine over when it checks for package installation.
+  if ($PidFile) { Set-Content -Path $PidFile -Value $process.Id -Encoding ascii }
+}
+
+# When the set was written last, so that the write of the application can be told apart from
+# the set that was there before.
+$setWriteTime = [datetime]::MinValue
+if ($Set -and (Test-Path $Set)) { $setWriteTime = (Get-Item $Set).LastWriteTime }
+
 # The installer helper of Ableton is given this many seconds to do its work before it is
 # dismissed.
 $helperWaitSeconds = 10
 $helperSeenAt = $null
 $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-$cleanupPids = @($process.Id)
+$cleanupPids = @()
+if ($process) { $cleanupPids = @($process.Id) }
 
 # The keys that dismiss the recovery prompt of Live, in the order they are tried.
 $recoveryKeys = @('n', 'esc')
@@ -1049,6 +1062,10 @@ $recoveryKeySentAt = $null
 
 try {
   while ((Get-Date) -lt $deadline) {
+    # The application was not started, because a permission prompt is waiting. There is
+    # nothing to watch for.
+    if ($null -eq $process) { break }
+
     Start-Sleep -Milliseconds 200
     $cleanupPids = @(Get-ProcessTreeIds @($process.Id))
     Debug-Log "process tree: $($cleanupPids -join ',')"

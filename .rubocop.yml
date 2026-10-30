@@ -57,12 +57,15 @@ RSpec/ExampleLength:
 RSpec/MultipleExpectations:
   Enabled: false
 
-# The window search and the permission prompt are parts of the PowerShell script, and the
-# script is not a class.
+# The window search, the permission prompt, the run state, the text of a window and the
+# recovery point are parts of the PowerShell script, and the script is not a class.
 RSpec/DescribeClass:
   Exclude:
-    - spec/gui_harness/window_search_spec.rb
-    - spec/gui_harness/permission_prompt_spec.rb
+    - spec/gui_harness/generic/window_search_spec.rb
+    - spec/gui_harness/live/permission_prompt_spec.rb
+    - spec/gui_harness/live/recovery_point_spec.rb
+    - spec/gui_harness/live/run_state_spec.rb
+    - spec/gui_harness/live/window_text_spec.rb
 
 Style/Documentation:
   Enabled: false

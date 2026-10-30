@@ -1,38 +1,31 @@
 <#
-  GUI process probe for real-app compatibility testing.
+  The generic library of the GUI harness.
 
-  This script is the Windows-side implementation of the harness contract:
-  - launch a GUI executable from WSL via PowerShell
-  - retain ownership of the process and its windows
-  - inspect the visible UIAutomation tree for real modal dialogs
-  - classify the dialog from its user-visible text
-  - dismiss the blocking control when possible
-  - save the set that was opened, when a path is given
-  - terminate the process tree cleanly before returning
+  This file holds what works for any GUI program on Windows: the enumeration of the windows,
+  the reading of the text of the dialogs, the dismissal of the dialogs, the process tree, and
+  the shutdown ladder.
+
+  The library holds functions and nothing else. It has no `param()` block, because a
+  dot-sourced script assigns its parameters in the caller's scope: a library that declared
+  `$Exe`, `$Set`, `$Log` or `$Visibility` would reset the values of the run that dot-sourced
+  it, silently, and the run would launch the wrong program or no program at all. The
+  parameters live in the entry point, `run.ps1`, which reads them after the library is loaded.
 #>
-param(
-  [Parameter(Mandatory=$true)][string]$Exe,
-  [Parameter(Mandatory=$true)][string]$Set,
-  [string]$Log = '',
-  [string]$SavePath = '',
-  [switch]$SaveInPlace,
-  [string]$PidFile = '',
-  [int]$TimeoutSeconds = 5,
-  [ValidateSet('normal','minimized','hidden')][string]$Visibility = 'normal',
-  [switch]$HarnessDebug
-)
-
-if ($HarnessDebug) { $env:GUI_HARNESS_DEBUG = '1' }
 
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 
-Add-Type @'
+# The type that holds the calls into the Windows API.
+#
+# The type is added only when it is not there yet, because a library that is dot-sourced
+# twice in one session would otherwise fail with "type name already exists".
+if (-not ('GuiHarness' -as [type])) {
+  Add-Type @'
 using System;
 using System.Text;
 using System.Runtime.InteropServices;
-public class Live {
+public class GuiHarness {
   [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc cb, IntPtr l);
   [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr parent, EnumWindowsProc cb, IntPtr l);
   public delegate bool EnumWindowsProc(IntPtr h, IntPtr l);
@@ -52,14 +45,15 @@ public class Live {
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT rect);
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, StringBuilder lParam);
-  [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+  [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
 }
 '@
+}
 
 function Stop-ProcessTree([int[]]$ProcessIds) {
   $seen = New-Object 'System.Collections.Generic.HashSet[int]'
   $stack = New-Object 'System.Collections.Generic.Stack[int]'
-  foreach ($processId in $ProcessIds) { if ($processId -gt 0) { $stack.Push($processId) } }
+  foreach ($targetPid in $ProcessIds) { if ($targetPid -gt 0) { $stack.Push($targetPid) } }
 
   while ($stack.Count -gt 0) {
     $currentPid = $stack.Pop()
@@ -69,15 +63,15 @@ function Stop-ProcessTree([int[]]$ProcessIds) {
     }
   }
 
-  foreach ($processId in $seen) {
-    try { Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue } catch {}
+  foreach ($targetPid in $seen) {
+    try { Stop-Process -Id $targetPid -Force -ErrorAction SilentlyContinue } catch {}
   }
 }
 
 function Get-ProcessTreeIds([int[]]$ProcessIds) {
   $seen = New-Object 'System.Collections.Generic.HashSet[int]'
   $stack = New-Object 'System.Collections.Generic.Stack[int]'
-  foreach ($processId in $ProcessIds) { if ($processId -gt 0) { $stack.Push($processId) } }
+  foreach ($targetPid in $ProcessIds) { if ($targetPid -gt 0) { $stack.Push($targetPid) } }
 
   while ($stack.Count -gt 0) {
     $currentPid = $stack.Pop()
@@ -92,67 +86,46 @@ function Get-ProcessTreeIds([int[]]$ProcessIds) {
 
 function Close-VisibleWindowsForPids([int[]]$ProcessIds) {
   $owners = New-Object 'System.Collections.Generic.HashSet[int]'
-  foreach ($processId in $ProcessIds) { if ($processId -gt 0) { [void]$owners.Add([int]$processId) } }
+  foreach ($targetPid in $ProcessIds) { if ($targetPid -gt 0) { [void]$owners.Add([int]$targetPid) } }
 
-  [Live]::EnumWindows({
+  [GuiHarness]::EnumWindows({
     param($handle, $lparam)
     $owner = 0
-    [void][Live]::GetWindowThreadProcessId($handle, [ref]$owner)
-    if ($owners.Contains([int]$owner) -and [Live]::IsWindowVisible($handle)) {
-      [void][Live]::PostMessage($handle, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
+    [void][GuiHarness]::GetWindowThreadProcessId($handle, [ref]$owner)
+    if ($owners.Contains([int]$owner) -and [GuiHarness]::IsWindowVisible($handle)) {
+      [void][GuiHarness]::PostMessage($handle, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
     }
     return $true
   }, [IntPtr]::Zero) | Out-Null
 }
 
-# Finds the installer helper of Ableton.
+# The windows of a set of programs, whether they are visible or not.
 #
-# Live checks for updates through a helper program of its own. The helper is not a child of
-# Live, so it is not in the tree of Live, and the tree cannot be used to find it. It is not a
-# Qt window either, so UI Automation does not see it. It blocks the machine while it runs: it
-# takes the screen, and Live waits for it. A run that meets the helper is a run that is blocked.
+# The keys of the harness go to the windows of the program, and not only to the visible
+# ones: a program that has a window that is not on the screen still holds the keys.
 #
-# @param Names the names of the helper processes
-# @return [array] the helper processes
-function Get-InstallHelpers([string[]]$Names = @('InstallHelper')) {
-  return @(Get-Process -Name $Names -ErrorAction SilentlyContinue)
-}
-
-# The prompts that ask for permission.
-#
-# The installer helper of Ableton asks for permission before it registers the file types of
-# Live, and Live waits for the helper. The prompt is on the secure desktop, where no program
-# of the session can reach it, so it is not answered by the harness and it is not answered by
-# the run either.
-#
-# Only the prompts of the installer of Ableton are of interest here: a prompt of any other
-# program is not the business of the harness.
-#
-# @return [array] the prompts of the installer that are waiting for an answer
-function Get-PermissionPrompts {
-  $prompts = @(Get-Process -Name 'consent' -ErrorAction SilentlyContinue)
-  return @($prompts | Where-Object { $_.MainWindowTitle -match 'InstallHelper' })
-}
-
-# Whether the application waits for a permission that cannot be given.
-#
-# Only Live waits for the installer of Ableton, and only a prompt of that installer holds Live
-# up. A prompt of any other program is of no account, and an application that is not Live does
-# not wait for it at all.
-#
-# @param Exe the path of the application
-# @param Prompts the prompts that are waiting for an answer
-# @return [bool] whether the application waits
-function Test-WaitsForPermission([string]$Exe, $Prompts) {
-  if ($Exe -notmatch 'Ableton Live') { return $false }
-  return (@($Prompts).Count -gt 0)
-}
-
-function Cleanup-Notepad() {
-  $notepads = @(Get-Process -Name 'notepad' -ErrorAction SilentlyContinue)
-  foreach ($notepad in $notepads) {
-    try { Stop-Process -Id $notepad.Id -Force -ErrorAction SilentlyContinue } catch {}
-  }
+# @param ProcessIds the processes whose windows are wanted
+# @return [Array] the windows, with their class and their title
+function Get-TopLevelWindows([int[]]$ProcessIds) {
+  $found = New-Object System.Collections.ArrayList
+  [GuiHarness]::EnumWindows({
+    param($handle, $lparam)
+    $owner = 0
+    [void][GuiHarness]::GetWindowThreadProcessId($handle, [ref]$owner)
+    if ($ProcessIds -contains [int]$owner) {
+      $class = New-Object System.Text.StringBuilder 256
+      [void][GuiHarness]::GetClassName($handle, $class, 256)
+      $title = New-Object System.Text.StringBuilder 1024
+      [void][GuiHarness]::GetWindowText($handle, $title, 1024)
+      [void]$found.Add([pscustomobject]@{
+        Handle = $handle
+        Class = $class.ToString()
+        Title = $title.ToString()
+      })
+    }
+    return $true
+  }, [IntPtr]::Zero) | Out-Null
+  return $found
 }
 
 function Set-ProcessWindowVisibility([int]$ProcessId, [string]$Visibility) {
@@ -162,12 +135,12 @@ function Set-ProcessWindowVisibility([int]$ProcessId, [string]$Visibility) {
     default { 1 }
   }
 
-  [Live]::EnumWindows({
+  [GuiHarness]::EnumWindows({
     param($handle, $lparam)
     $owner = 0
-    [void][Live]::GetWindowThreadProcessId($handle, [ref]$owner)
+    [void][GuiHarness]::GetWindowThreadProcessId($handle, [ref]$owner)
     if ($owner -eq $ProcessId) {
-      [void][Live]::ShowWindow($handle, $mode)
+      [void][GuiHarness]::ShowWindow($handle, $mode)
     }
     return $true
   }, [IntPtr]::Zero) | Out-Null
@@ -197,10 +170,9 @@ function Get-KeyCode([string]$Key) {
 
 # Sends a key to the windows of an application.
 #
-# The dialogs of Live are Qt windows, and UI Automation sees nothing in them, so a dialog of Live
-# is read from its log and dismissed with the keyboard. The key is posted to the windows of the
-# application, and not to the foreground window: a modal dialog of Live is a window of Live, but
-# the window that has the focus is not necessarily the dialog.
+# The key is posted to the windows of the application, and not to the foreground window: a
+# modal dialog is a window of the application, but the window that has the focus is not
+# necessarily the dialog.
 #
 # @param ProcessIds the processes the key goes to
 # @param Key the name of the key
@@ -209,21 +181,17 @@ function Send-KeyToWindows([int[]]$ProcessIds, [string]$Key) {
   $code = Get-KeyCode $Key
   if ($code -eq 0) { return 0 }
 
-  $script:sent = 0
-  [Live]::EnumWindows({
-    param($handle, $lparam)
-    $owner = 0
-    [void][Live]::GetWindowThreadProcessId($handle, [ref]$owner)
-    if ($ProcessIds -contains [int]$owner) {
-      [void][Live]::PostMessage($handle, 0x0100, [IntPtr]$code, [IntPtr]::Zero)
-      [void][Live]::PostMessage($handle, 0x0101, [IntPtr]$code, [IntPtr]::Zero)
-      $script:sent++
+  $sent = 0
+  foreach ($targetPid in $ProcessIds) {
+    foreach ($window in Get-TopLevelWindows @($targetPid)) {
+      [void][GuiHarness]::PostMessage($window.Handle, 0x0100, [IntPtr]$code, [IntPtr]::Zero)
+      [void][GuiHarness]::PostMessage($window.Handle, 0x0101, [IntPtr]$code, [IntPtr]::Zero)
+      $sent++
     }
-    return $true
-  }, [IntPtr]::Zero) | Out-Null
+  }
 
-  Debug-Log "sent $Key to $script:sent windows"
-  return $script:sent
+  Debug-Log "sent $Key to $sent windows"
+  return $sent
 }
 
 # Sends a shortcut to the windows of an application.
@@ -249,27 +217,23 @@ function Send-ShortcutToWindows([int[]]$ProcessIds, [string[]]$Modifiers, [strin
     }
   }
 
-  $script:sent = 0
-  [Live]::EnumWindows({
-    param($handle, $lparam)
-    $owner = 0
-    [void][Live]::GetWindowThreadProcessId($handle, [ref]$owner)
-    if ($ProcessIds -contains [int]$owner) {
+  $sent = 0
+  foreach ($targetPid in $ProcessIds) {
+    foreach ($window in Get-TopLevelWindows @($targetPid)) {
       foreach ($modifier in $modifierCodes) {
-        [void][Live]::PostMessage($handle, 0x0100, [IntPtr]$modifier, [IntPtr]::Zero)
+        [void][GuiHarness]::PostMessage($window.Handle, 0x0100, [IntPtr]$modifier, [IntPtr]::Zero)
       }
-      [void][Live]::PostMessage($handle, 0x0100, [IntPtr]$code, [IntPtr]::Zero)
-      [void][Live]::PostMessage($handle, 0x0101, [IntPtr]$code, [IntPtr]::Zero)
+      [void][GuiHarness]::PostMessage($window.Handle, 0x0100, [IntPtr]$code, [IntPtr]::Zero)
+      [void][GuiHarness]::PostMessage($window.Handle, 0x0101, [IntPtr]$code, [IntPtr]::Zero)
       foreach ($modifier in $modifierCodes) {
-        [void][Live]::PostMessage($handle, 0x0101, [IntPtr]$modifier, [IntPtr]::Zero)
+        [void][GuiHarness]::PostMessage($window.Handle, 0x0101, [IntPtr]$modifier, [IntPtr]::Zero)
       }
-      $script:sent++
+      $sent++
     }
-    return $true
-  }, [IntPtr]::Zero) | Out-Null
+  }
 
-  Debug-Log "sent the shortcut $Key to $script:sent windows"
-  return $script:sent
+  Debug-Log "sent the shortcut $Key to $sent windows"
+  return $sent
 }
 
 # Brings a window to the foreground.
@@ -282,20 +246,20 @@ function Send-ShortcutToWindows([int[]]$ProcessIds, [string[]]$Modifiers, [strin
 # @param Handle the handle of the window
 # @return [boolean] whether the window is in the foreground
 function Focus-Window([IntPtr]$Handle) {
-  [void][Live]::ShowWindow($Handle, 9)
+  [void][GuiHarness]::ShowWindow($Handle, 9)
   Start-Sleep -Milliseconds 100
-  [void][Live]::BringWindowToTop($Handle)
-  [void][Live]::SetForegroundWindow($Handle)
+  [void][GuiHarness]::BringWindowToTop($Handle)
+  [void][GuiHarness]::SetForegroundWindow($Handle)
   Start-Sleep -Milliseconds 100
 
-  if ([Live]::GetForegroundWindow() -ne $Handle) {
-    [Live]::keybd_event(0x12, 0, 0, [IntPtr]::Zero)
-    [Live]::keybd_event(0x12, 0, 2, [IntPtr]::Zero)
-    [void][Live]::SetForegroundWindow($Handle)
+  if ([GuiHarness]::GetForegroundWindow() -ne $Handle) {
+    [GuiHarness]::keybd_event(0x12, 0, 0, [IntPtr]::Zero)
+    [GuiHarness]::keybd_event(0x12, 0, 2, [IntPtr]::Zero)
+    [void][GuiHarness]::SetForegroundWindow($Handle)
     Start-Sleep -Milliseconds 100
   }
 
-  return ([Live]::GetForegroundWindow() -eq $Handle)
+  return ([GuiHarness]::GetForegroundWindow() -eq $Handle)
 }
 
 # Brings the app to the foreground and sends it a key.
@@ -321,13 +285,6 @@ function Escape-Keys([string]$Text) {
   return [regex]::Replace($Text, '([+\^%~(){}\[\]])', '{$1}')
 }
 
-# Finds the dialogs that say something.
-#
-# A dialog that says something is a window of the standard class, and it holds the text of
-# its message in the controls that hold static text. The text is what says what the dialog
-# is asking for, and which of its buttons is the right one to press.
-#
-# @return [Array] the dialogs, with their text and their buttons
 # Dismisses the dialogs that say something.
 #
 # A dialog that says something holds the program up: the program does not answer the keys that
@@ -378,8 +335,8 @@ function Find-MainWindow([int]$ProcessId) {
   foreach ($window in Get-Windows $ProcessId) {
     if ($window.Class -eq '#32770') { continue }
 
-    $rect = New-Object Live+RECT
-    [void][Live]::GetWindowRect($window.Handle, [ref]$rect)
+    $rect = New-Object GuiHarness+RECT
+    [void][GuiHarness]::GetWindowRect($window.Handle, [ref]$rect)
     $area = ($rect.Right - $rect.Left) * ($rect.Bottom - $rect.Top)
 
     # A window without a title is the window of the application while the set is still loading,
@@ -403,9 +360,6 @@ function Find-MainWindow([int]$ProcessId) {
 }
 
 # Waits for the window of the application to be there and to have its title.
-#
-# The set is loaded before the window of the application has its title, so the keys that are
-# sent to it too early are lost.
 #
 # @param ProcessId the process of the application
 # @param Seconds how long to wait
@@ -460,8 +414,23 @@ function Find-MessageDialogs([int[]]$ProcessIds) {
 # @return [boolean] whether the button was pressed
 function Press-Button($Button) {
   if ($null -eq $Button) { return $false }
-  [void][Live]::SendMessage($Button.Handle, 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)
+  [void][GuiHarness]::SendMessage($Button.Handle, 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)
   return $true
+}
+
+# Writes down the windows of the programs that have a user interface, and the controls they
+# hold, so that a dialog that was not recognized can be looked at.
+#
+# @param ProcessIds the processes whose windows are looked at
+# @return [void]
+function Dump-GuiWindows([int[]]$ProcessIds) {
+  foreach ($window in Get-ProcessWindows $ProcessIds) {
+    Debug-Log "gui window: class=$($window.Class) title=$($window.Title)"
+    $tree = @(Get-ChildWindows $window.Handle)
+    foreach ($child in $tree) {
+      Debug-Log "  child: class=$($child.Class) title=$($child.Title) parent=$($child.Parent)"
+    }
+  }
 }
 
 # Finds the dialog that asks for the name of a file.
@@ -474,19 +443,8 @@ function Press-Button($Button) {
 # not always a window of the program that was launched: a program can ask another program to
 # put up its dialog.
 #
+# @param ProcessIds the processes whose windows are looked at
 # @return the dialog, with the field and the button, or $null when there is none
-# Writes down the windows of the programs that have a user interface, and the controls they
-# hold, so that a dialog that was not recognized can be looked at.
-function Dump-GuiWindows([int[]]$ProcessIds) {
-  foreach ($window in Get-ProcessWindows $ProcessIds) {
-    Debug-Log "gui window: class=$($window.Class) title=$($window.Title)"
-    $tree = @(Get-ChildWindows $window.Handle)
-    foreach ($child in $tree) {
-      Debug-Log "  child: class=$($child.Class) title=$($child.Title) parent=$($child.Parent)"
-    }
-  }
-}
-
 function Find-FileDialog([int[]]$ProcessIds) {
   foreach ($window in Get-ProcessWindows $ProcessIds) {
     # The windows inside the window are read in one go, because reading them again for every
@@ -541,41 +499,61 @@ function Find-FileDialog([int[]]$ProcessIds) {
   return $null
 }
 
-# Saves the set that the application has open.
-#
-# The save is done with the keyboard: the application is brought to the foreground, its Save As
-# command is sent, the path of the set is typed, and the save is confirmed. The file that
-# appears is what says whether the save worked.
+# The paths the set that was saved may have been written to.
 #
 # The path that is typed has no extension, because the application gives the set its own name
 # and puts it in a project folder: a set that is saved as "C:/sets/Foo" is written as
 # "C:/sets/Foo Project/Foo.als". Both are looked for, so that the file that appears is found
 # wherever the application puts it.
 #
+# @param Path the path of the set to write
+# @return [Array] the paths the set may have been written to
+function Get-SaveCandidatePaths-Generic([string]$Path) {
+  $name = [System.IO.Path]::GetFileNameWithoutExtension($Path)
+  $directory = [System.IO.Path]::GetDirectoryName($Path)
+  return @($Path, [System.IO.Path]::Combine($directory, $name))
+}
+
+# The paths the set that was saved may have been written to.
+#
+# @param Path the path of the set to write
+# @return [Array] the paths the set may have been written to
+function Get-SaveCandidatePaths([string]$Path) {
+  return (Get-SaveCandidatePaths-Generic $Path)
+}
+
+# Saves the set that the application has open.
+#
+# The save is done with the keyboard: the application is brought to the foreground, its Save As
+# command is sent, the path of the set is typed, and the save is confirmed. The file that
+# appears is what says whether the save worked.
+#
 # A file that is already there is not a save: the file has to be written after the save was
 # asked for, so that a set that was left over from an earlier run is not taken for the result.
 #
-# @param ProcessId the process the keys go to
-# @param ProcessIds the processes whose windows are looked at
+# @param Context the run the save belongs to
 # @param Path the path of the set to write
 # @return [string] the path the set was written to, or an empty string when it was not written
-function Save-Document([int]$ProcessId, [int[]]$ProcessIds, [string]$Path) {
+function Save-Document($Context, [string]$Path) {
   $shell = New-Object -ComObject WScript.Shell
   $asked = Get-Date
+  $processId = 0
+  if ($null -ne $Context.Process) { $processId = $Context.Process.Id }
+  $processIds = @($Context.ProcessIds)
 
   # A dialog that is up holds the application up, and the keys that go to the application are
   # lost while it is there. The dialogs are dismissed before the keys are sent.
-  [void](Dismiss-MessageDialogs $ProcessIds)
+  [void](Dismiss-MessageDialogs $processIds)
 
   # The window of the application itself is the one that takes the keys. A window that is a
   # dialog is not that window, even when it has a title: the Kontakt error box of Live has a
   # title, and the keys that go to it are lost.
-  $main = Wait-ForMainWindow $ProcessId 10
+  $main = Wait-ForMainWindow $processId 10
   if ($null -ne $main) {
     Debug-Log "the window of the application is '$($main.Title)'"
     Debug-Log "the window of the application is in the foreground: $(Focus-Window $main.Handle)"
   } else {
-    Debug-Log "the application was brought to the foreground: $($shell.AppActivate($ProcessId))"
+    Debug-Log "the application was brought to the foreground: $($shell.AppActivate($processId))"
   }
   Start-Sleep -Milliseconds 500
 
@@ -594,12 +572,12 @@ function Save-Document([int]$ProcessId, [int[]]$ProcessIds, [string]$Path) {
   $dialogDeadline = (Get-Date).AddSeconds(10)
   while ((Get-Date) -lt $dialogDeadline) {
     Start-Sleep -Milliseconds 200
-    $dialog = Find-FileDialog $ProcessIds
+    $dialog = Find-FileDialog $processIds
     if ($null -ne $dialog) { break }
 
     # A dialog that comes up while the save dialog is waited for holds the application up, and
     # the save dialog never comes up while it is there.
-    [void](Dismiss-MessageDialogs $ProcessIds)
+    [void](Dismiss-MessageDialogs $processIds)
 
     if (((Get-Date) - $askedAgain).TotalSeconds -ge 1) {
       $askedAgain = Get-Date
@@ -611,12 +589,12 @@ function Save-Document([int]$ProcessId, [int[]]$ProcessIds, [string]$Path) {
     if (-not $dumped) {
       $dumped = $true
       Debug-Log 'no save dialog yet'
-      Dump-GuiWindows $ProcessIds
+      Dump-GuiWindows $processIds
     }
   }
   if ($null -eq $dialog) {
     Debug-Log 'no save dialog came up'
-    Dump-GuiWindows $ProcessIds
+    Dump-GuiWindows $processIds
     return ''
   }
   Debug-Log "the save dialog is up: class=$($dialog.Window.Class) title=$($dialog.Window.Title)"
@@ -632,11 +610,11 @@ function Save-Document([int]$ProcessId, [int[]]$ProcessIds, [string]$Path) {
     # into it directly, and the button that confirms the save is pressed.
     Debug-Log "putting the path $typed into the field of the dialog"
     $text = New-Object System.Text.StringBuilder $typed
-    [void][Live]::SendMessage($dialog.Edit.Handle, 0x000C, [IntPtr]::Zero, $text)
+    [void][GuiHarness]::SendMessage($dialog.Edit.Handle, 0x000C, [IntPtr]::Zero, $text)
     Start-Sleep -Milliseconds 200
     if ($null -ne $dialog.Save) {
       Debug-Log "pressing the '$($dialog.Save.Title)' button"
-      [void][Live]::SendMessage($dialog.Save.Handle, 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)
+      [void][GuiHarness]::SendMessage($dialog.Save.Handle, 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero)
     } else {
       $shell.SendKeys('{ENTER}')
     }
@@ -647,12 +625,7 @@ function Save-Document([int]$ProcessId, [int[]]$ProcessIds, [string]$Path) {
     $shell.SendKeys('{ENTER}')
   }
 
-  # Live writes a set as a project folder, so the set is looked for in the folder as well.
-  $candidates = @(
-    $Path,
-    ($typed + '.als'),
-    [System.IO.Path]::Combine($directory, ($name + ' Project'), ($name + '.als'))
-  )
+  $candidates = @(Get-SaveCandidatePaths $Path)
 
   $deadline = (Get-Date).AddSeconds(10)
   while ((Get-Date) -lt $deadline) {
@@ -686,9 +659,14 @@ function Wait-ForSet([string]$Path, [datetime]$Before) {
   return ''
 }
 
-function Read-Log([long]$Start) {
-  if (-not $Log -or -not (Test-Path $Log)) { return '' }
-  $stream = [System.IO.File]::Open($Log, 'Open', 'Read', 'ReadWrite')
+# Reads the log of the application.
+#
+# @param Path the path of the log
+# @param Start where in the log to start reading
+# @return [string] the text of the log, or an empty string when there is no log
+function Read-Log([string]$Path, [long]$Start = 0) {
+  if (-not $Path -or -not (Test-Path $Path)) { return '' }
+  $stream = [System.IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
   $stream.Seek($Start, 'Begin') | Out-Null
   $reader = New-Object System.IO.StreamReader($stream)
   $text = $reader.ReadToEnd()
@@ -697,25 +675,7 @@ function Read-Log([long]$Start) {
 }
 
 function Get-Windows([int]$ProcessId) {
-  $found = New-Object System.Collections.ArrayList
-  [Live]::EnumWindows({
-    param($handle, $lparam)
-    $owner = 0
-    [void][Live]::GetWindowThreadProcessId($handle, [ref]$owner)
-    if ($owner -eq $ProcessId -and [Live]::IsWindowVisible($handle)) {
-      $class = New-Object System.Text.StringBuilder 256
-      [void][Live]::GetClassName($handle, $class, 256)
-      $title = New-Object System.Text.StringBuilder 1024
-      [void][Live]::GetWindowText($handle, $title, 1024)
-      [void]$found.Add([pscustomobject]@{
-        Handle = $handle
-        Class = $class.ToString()
-        Title = $title.ToString()
-      })
-    }
-    return $true
-  }, [IntPtr]::Zero) | Out-Null
-  return $found
+  return @(Get-TopLevelWindows @($ProcessId) | Where-Object { [GuiHarness]::IsWindowVisible($_.Handle) })
 }
 
 # The windows that belong to a window.
@@ -732,17 +692,17 @@ function Get-Windows([int]$ProcessId) {
 # @return [Array] the windows in the tree, with their class, their title and their parent
 function Get-ChildWindows([IntPtr]$Parent) {
   $found = New-Object System.Collections.ArrayList
-  [Live]::EnumChildWindows($Parent, {
+  [GuiHarness]::EnumChildWindows($Parent, {
     param($handle, $lparam)
     $class = New-Object System.Text.StringBuilder 256
-    [void][Live]::GetClassName($handle, $class, 256)
+    [void][GuiHarness]::GetClassName($handle, $class, 256)
     $title = New-Object System.Text.StringBuilder 1024
-    [void][Live]::GetWindowText($handle, $title, 1024)
+    [void][GuiHarness]::GetWindowText($handle, $title, 1024)
     [void]$found.Add([pscustomobject]@{
       Handle = $handle
       Class = $class.ToString()
       Title = $title.ToString()
-      Parent = [Live]::GetParent($handle)
+      Parent = [GuiHarness]::GetParent($handle)
     })
     return $true
   }, [IntPtr]::Zero) | Out-Null
@@ -822,16 +782,16 @@ function Get-AncestorClasses($Window, $Tree) {
 # @return [Array] the visible windows, with the program they belong to
 function Get-GuiWindows {
   $found = New-Object System.Collections.ArrayList
-  [Live]::EnumWindows({
+  [GuiHarness]::EnumWindows({
     param($handle, $lparam)
-    if (-not [Live]::IsWindowVisible($handle)) { return $true }
+    if (-not [GuiHarness]::IsWindowVisible($handle)) { return $true }
 
     $owner = 0
-    [void][Live]::GetWindowThreadProcessId($handle, [ref]$owner)
+    [void][GuiHarness]::GetWindowThreadProcessId($handle, [ref]$owner)
     $class = New-Object System.Text.StringBuilder 256
-    [void][Live]::GetClassName($handle, $class, 256)
+    [void][GuiHarness]::GetClassName($handle, $class, 256)
     $title = New-Object System.Text.StringBuilder 1024
-    [void][Live]::GetWindowText($handle, $title, 1024)
+    [void][GuiHarness]::GetWindowText($handle, $title, 1024)
 
     $program = ''
     try { $program = (Get-Process -Id $owner -ErrorAction Stop).ProcessName } catch { }
@@ -856,13 +816,13 @@ function Get-GuiWindows {
 # @return [Array] the visible windows, with the program they belong to
 function Get-ProcessWindows([int[]]$ProcessIds) {
   $found = New-Object System.Collections.ArrayList
-  foreach ($processId in $ProcessIds) {
-    foreach ($window in Get-Windows $processId) {
+  foreach ($targetPid in $ProcessIds) {
+    foreach ($window in Get-Windows $targetPid) {
       [void]$found.Add([pscustomobject]@{
         Handle = $window.Handle
         Class = $window.Class
         Title = $window.Title
-        ProcessId = $processId
+        ProcessId = $targetPid
       })
     }
   }
@@ -882,9 +842,6 @@ function Test-IsModal($Element) {
 # An application is not a dialog. The windows of an application hold the whole of its
 # interface, so the text of a window says nothing about whether the application is blocked.
 # A dialog is a window inside it that is modal, and its own text is the text of the dialog.
-#
-# The dialogs of Live are Qt windows, and UI Automation sees nothing in them, so a dialog of
-# Live is read from its log instead.
 #
 # @param Handle the handle of a window of the application
 # @return the modal dialog, or $null when there is none
@@ -942,17 +899,34 @@ function Click-Button($Element, [string]$Label) {
   } catch { return $false }
 }
 
-function Get-DialogInfo([string]$Text) {
+# The programs to stop besides the tree of the application.
+#
+# The generic layer knows of no such program.
+#
+# @return [array] the ids of the programs
+function Get-ExtraProcessIds-Generic {
+  return @()
+}
+
+# The programs to stop besides the tree of the application.
+#
+# @return [array] the ids of the programs
+function Get-ExtraProcessIds {
+  return (Get-ExtraProcessIds-Generic)
+}
+
+# The dialogs of any GUI program, and the action that answers them.
+#
+# @param Text the text of the dialog
+# @return [object] the family of the dialog, the action, and the way the action is done
+function Get-DialogInfo-Generic([string]$Text) {
   if (-not $Text) { return [pscustomobject]@{ Type = 'none'; Action = $null; ActionType = $null; ActionValue = $null } }
 
   $normalized = $Text.Trim()
-  if ($normalized -match 'InstallHelper|installing packages') {
-    return [pscustomobject]@{ Type = 'updater'; Action = $null; ActionType = $null; ActionValue = $null }
-  }
-  if ($normalized -match 'A serious program error has occurred\.|fatal error|Live will shut down after this message box is closed\.|program error') {
+  if ($normalized -match 'A serious program error has occurred\.|fatal error|program error') {
     return [pscustomobject]@{ Type = 'fatal'; Action = 'OK'; ActionType = 'button'; ActionValue = 'OK' }
   }
-  if ($normalized -match 'Would you like to recover your work\?|recover your work|Live unexpectedly quit while you were working on the Live Set') {
+  if ($normalized -match 'Would you like to recover your work\?|recover your work') {
     return [pscustomobject]@{ Type = 'recovery'; Action = 'No'; ActionType = 'button'; ActionValue = 'No' }
   }
   if ($normalized -match 'Save changes\?|Do you want to save the changes\?') {
@@ -965,6 +939,395 @@ function Get-DialogInfo([string]$Text) {
   return [pscustomobject]@{ Type = 'unknown'; Action = $null; ActionType = $null; ActionValue = $null }
 }
 
+# The dialogs of any GUI program, and the action that answers them.
+#
+# @param Text the text of the dialog
+# @return [object] the family of the dialog, the action, and the way the action is done
+function Get-DialogInfo([string]$Text) {
+  return (Get-DialogInfo-Generic $Text)
+}
+
+# Starts the application.
+#
+# The application is not started while a permission prompt is waiting. The prompt is on the
+# secure desktop, where nothing of the session can answer it, and the application waits for
+# the permission.
+#
+# @param Exe the path of the application
+# @param Arguments the arguments of the application
+# @param Visibility the visibility of the window of the application
+# @param Prompts the prompts that are waiting for an answer; the prompts that are waiting are
+#   looked for when they are not given
+# @return [object] the process of the application, or $null when it was not started
+function Start-Application([string]$Exe, [string[]]$Arguments, [string]$Visibility, $Prompts = $null) {
+  if ($null -eq $Prompts) { $Prompts = @(Get-PermissionPrompts) }
+  if (Test-WaitsForPermission $Exe $Prompts) {
+    Debug-Log "a prompt is asking for permission ($(@($Prompts).Count) of them); the application is not started"
+    return $null
+  }
+
+  $windowStyle = switch ($Visibility) {
+    'hidden' { 'Normal' }
+    'minimized' { 'Normal' }
+    default { 'Normal' }
+  }
+
+  # The arguments are quoted, because the path of a set may hold spaces, and an argument
+  # that is not quoted is split into as many arguments as it has words.
+  $quoted = @($Arguments | ForEach-Object { '"' + $_ + '"' })
+
+  $process = if ($quoted.Count -gt 0) {
+    Start-Process -FilePath $Exe -ArgumentList $quoted -PassThru -WindowStyle $windowStyle
+  } else {
+    Start-Process -FilePath $Exe -PassThru -WindowStyle $windowStyle
+  }
+  if ($Visibility -ne 'normal') { Set-ProcessWindowVisibility $process.Id $Visibility }
+  return $process
+}
+
+# Stops the programs of the session that are of no account to the run.
+#
+# @return [void]
+function Cleanup-Notepad {
+  $notepads = @(Get-Process -Name 'notepad' -ErrorAction SilentlyContinue)
+  foreach ($notepad in $notepads) {
+    try { Stop-Process -Id $notepad.Id -Force -ErrorAction SilentlyContinue } catch {}
+  }
+}
+
+# The prompts that ask for permission.
+#
+# The generic layer knows of no prompt that cannot be answered.
+#
+# @return [array] the prompts that are waiting for an answer
+function Get-PermissionPrompts-Generic {
+  return @()
+}
+
+# The prompts that ask for permission.
+#
+# @return [array] the prompts that are waiting for an answer
+function Get-PermissionPrompts {
+  return (Get-PermissionPrompts-Generic)
+}
+
+# Whether the application waits for a permission that cannot be given.
+#
+# The generic layer knows of no application that waits for a permission.
+#
+# @param Exe the path of the application
+# @param Prompts the prompts that are waiting for an answer
+# @return [bool] whether the application waits
+function Test-WaitsForPermission-Generic([string]$Exe, $Prompts) {
+  return $false
+}
+
+# Whether the application waits for a permission that cannot be given.
+#
+# @param Exe the path of the application
+# @param Prompts the prompts that are waiting for an answer
+# @return [bool] whether the application waits
+function Test-WaitsForPermission([string]$Exe, $Prompts) {
+  return (Test-WaitsForPermission-Generic $Exe $Prompts)
+}
+
+# The update that is waiting to be installed.
+#
+# The generic layer knows of no update that waits to be installed.
+#
+# @param LogText the text of the log
+# @return [string] the version of the update that is waiting, or an empty string when there is
+#   no update waiting
+function Get-PendingUpdate-Generic([string]$LogText) {
+  return ''
+}
+
+# The update that is waiting to be installed.
+#
+# @param LogText the text of the log
+# @return [string] the version of the update that is waiting, or an empty string when there is
+#   no update waiting
+function Get-PendingUpdate([string]$LogText) {
+  return (Get-PendingUpdate-Generic $LogText)
+}
+
+# What the run does before the application is started.
+#
+# The generic layer starts the application straight away.
+#
+# @param Context the run that is starting
+# @return [void]
+function Invoke-PreRunCleanup-Generic($Context) {
+  Cleanup-Notepad
+}
+
+# What the run does before the application is started.
+#
+# @param Context the run that is starting
+# @return [void]
+function Invoke-PreRunCleanup($Context) {
+  Invoke-PreRunCleanup-Generic $Context
+}
+
+# The facts about the run, as the run state holds them.
+#
+# @return [object] the run state
+function New-RunState {
+  return [pscustomobject]@{
+    Crashed = $false
+    Dialog = $null
+    Dismissed = @()
+    Done = $false
+    HelperSeenAt = $null
+    LastMessage = $null
+    Loaded = $false
+    PermissionSeenAt = $null
+    Recovered = $false
+    RecoveryAttempt = 0
+    RecoveryKeySentAt = $null
+    RecoveryKeys = @('n', 'esc')
+    ReadWindows = @{}
+    Updater = $false
+  }
+}
+
+# The run itself, as the rungs of the ladder see it.
+#
+# @param LogStart where in the log the run starts
+# @return [object] the context of the run
+function New-RunContext([long]$LogStart = 0) {
+  $rungs = @()
+  foreach ($rung in ([string]$ShutdownRungs -split ',')) {
+    $trimmed = $rung.Trim()
+    if ($trimmed) { $rungs += $trimmed }
+  }
+
+  return [pscustomobject]@{
+    ApplicationGone = $false
+    CleanExitConfirmed = $false
+    Deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    ExitedCleanly = $false
+    ExtraPids = @()
+    Log = $Log
+    LogStart = $LogStart
+    Process = $null
+    ProcessIds = @()
+    Saved = ''
+    SaveInPlace = [bool]$SaveInPlace
+    SavePath = $SavePath
+    Set = $Set
+    SetWriteTime = [datetime]::MinValue
+    ShutdownRungs = $rungs
+    WentAwayByItself = $false
+  }
+}
+
+# The dialogs of the standard class, and what is done with them.
+#
+# A dialog of the standard class holds the text of its message in the controls that hold
+# static text, and it holds the buttons that answer it. The button that answers it is
+# pressed, so that the dialog goes away the way a person would make it go away.
+#
+# @param State the state of the run
+# @param Context the run
+# @return [void]
+function Update-RunState-MessageDialogs($State, $Context) {
+  foreach ($messageDialog in Find-MessageDialogs $Context.ProcessIds) {
+    $messageText = $messageDialog.Text
+    if ($messageText -eq $State.LastMessage) { continue }
+
+    if ($messageText -match 'serious program error|fatal error|shut down after this message box') {
+      $State.Dialog = $messageText
+      $State.Crashed = $true
+      $State.LastMessage = $messageText
+      continue
+    }
+
+    $State.LastMessage = $messageText
+    $State.Dismissed += $messageText
+    Debug-Log "the dialog says: $messageText"
+
+    $button = $messageDialog.Buttons | Where-Object { $_.Title -match '^(OK|&OK)$' } | Select-Object -First 1
+    if ($null -eq $button) {
+      $button = $messageDialog.Buttons | Where-Object { $_.Title -match '^(No|&No)$' } | Select-Object -First 1
+    }
+    if ($null -ne $button) {
+      Debug-Log "pressing the '$($button.Title)' button of the dialog"
+      [void](Press-Button $button)
+    } else {
+      # The dialog has no button that is known, so the key that closes it is sent to the
+      # window that has the focus.
+      Debug-Log 'the dialog has no known button, sending the escape to the foreground'
+      [void](Send-DismissKey $Context.Process.Id '{ESC}')
+    }
+  }
+}
+
+# The modal dialogs of the windows of the application.
+#
+# @param State the state of the run
+# @param Context the run
+# @return [void]
+function Update-RunState-Windows($State, $Context) {
+  foreach ($targetPid in $Context.ProcessIds) {
+    foreach ($window in Get-Windows $targetPid) {
+      $dialogElement = Get-DialogElement $window.Handle
+      $shown = Get-DialogText $dialogElement
+      Debug-Log "window PID=$targetPid class=$($window.Class) title=$($window.Title) text=$shown"
+      if (-not $shown) { continue }
+
+      $dialogInfo = Get-DialogInfo $shown
+      $State.Dialog = $shown
+
+      if ($dialogInfo.Type -eq 'fatal') {
+        $State.Crashed = $true
+        [void](Click-Button $dialogElement $dialogInfo.Action)
+        break
+      }
+
+      if ($dialogInfo.Type -eq 'recovery') {
+        if (Click-Button $dialogElement $dialogInfo.Action) {
+          $State.Recovered = $true
+          $State.Dialog = $null
+          break
+        }
+      }
+
+      if ($dialogInfo.Type -eq 'save_changes') {
+        [void](Click-Button $dialogElement $dialogInfo.Action)
+      }
+
+      if ($dialogInfo.Type -and $dialogInfo.Type -ne 'unknown') { break }
+    }
+    if ($State.Dialog) { break }
+  }
+}
+
+# What the run knows about the application, from its windows.
+#
+# @param State the state of the run
+# @param Context the run
+# @return [void]
+function Update-RunState-Generic($State, $Context) {
+  Update-RunState-MessageDialogs $State $Context
+  Update-RunState-Windows $State $Context
+}
+
+# What the run knows about the application.
+#
+# @param State the state of the run
+# @param Context the run
+# @return [void]
+function Update-RunState($State, $Context) {
+  Update-RunState-Generic $State $Context
+}
+
+# The dialog that is reported when nothing else holds the application up.
+#
+# @param State the state of the run
+# @return [string] the text of the dialog, or $null when there is none
+function Get-BlockedDialog-Generic($State) {
+  return $State.Dialog
+}
+
+# The dialog that is reported when nothing else holds the application up.
+#
+# @param State the state of the run
+# @return [string] the text of the dialog, or $null when there is none
+function Get-BlockedDialog($State) {
+  return (Get-BlockedDialog-Generic $State)
+}
+
+# Whether the application is gone.
+#
+# @param Context the run
+# @return [bool] whether the application is gone
+function Test-ApplicationGone($Context) {
+  if ($null -eq $Context.Process) { return $true }
+  $ids = @(Get-ProcessTreeIds @($Context.Process.Id))
+  $running = @($ids | ForEach-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
+  return ($running.Count -eq 0)
+}
+
+# Whether the ladder has nothing left to climb.
+#
+# @param Context the run
+# @return [bool] whether the ladder is done
+function Test-LadderComplete-Generic($Context) {
+  return ($Context.ApplicationGone -and @($Context.ExtraPids).Count -eq 0)
+}
+
+# Whether the ladder has nothing left to climb.
+#
+# @param Context the run
+# @return [bool] whether the ladder is done
+function Test-LadderComplete($Context) {
+  return (Test-LadderComplete-Generic $Context)
+}
+
+# The rung that asks the application to close, the way a person closes it.
+#
+# @param Context the run
+# @return [bool] whether the ladder may stop
+function close_windows($Context) {
+  Close-VisibleWindowsForPids (@($Context.ProcessIds) + @($Context.ExtraPids))
+  return $false
+}
+
+# The rung that waits for the application to go away by itself.
+#
+# @param Context the run
+# @return [bool] whether the ladder may stop
+function wait_for_exit($Context) {
+  $deadline = (Get-Date).AddSeconds(5)
+  while ((Get-Date) -lt $deadline) {
+    if (Test-ApplicationGone $Context) {
+      $Context.ApplicationGone = $true
+      $Context.WentAwayByItself = $true
+      $Context.ExitedCleanly = $true
+      break
+    }
+    Start-Sleep -Milliseconds 200
+  }
+
+  # The set is written while the application is closing, so the set is waited for before what
+  # is left of the tree is stopped.
+  if ($Context.SaveInPlace -and -not $Context.Saved -and $null -ne $Context.Process) {
+    $Context.Saved = Wait-ForSet $Context.Set $Context.SetWriteTime
+    Debug-Log "saved: $Context.Saved"
+  }
+
+  return $Context.ApplicationGone
+}
+
+# The rung that stops what is left of the tree.
+#
+# @param Context the run
+# @return [bool] whether the ladder may stop
+function stop_tree($Context) {
+  Stop-ProcessTree (@($Context.ProcessIds) + @($Context.ExtraPids))
+  return $true
+}
+
+# Climbs the ladder of the layer, in the order the layer holds it.
+#
+# A rung the layer does not have is not climbed: the order of the rungs belongs to the layer
+# that asked for the run, and the mechanics of a rung belong to the layer that has it.
+#
+# @param Context the run
+# @return [void]
+function Invoke-ShutdownLadder($Context) {
+  foreach ($rung in $Context.ShutdownRungs) {
+    if (-not (Get-Command $rung -ErrorAction SilentlyContinue)) {
+      Debug-Log "the rung $rung is not part of this layer; it is not climbed"
+      continue
+    }
+    Debug-Log "climbing the rung $rung"
+    [void](& $rung $Context)
+    if (Test-LadderComplete $Context) { break }
+  }
+}
+
 # The body of the script.
 #
 # The functions above are the parts of the harness that can be tested on their own: a test
@@ -972,373 +1335,108 @@ function Get-DialogInfo([string]$Text) {
 # when the script is run, and not when it is dot-sourced.
 function Invoke-Main {
 
-# A Live that is still running from an earlier run is closed before this run starts.
-#
-# It is closed, and not killed: a Live that is killed while it checks for package installation
-# checks again on the next start, and puts up the installer of Ableton. The installer takes the
-# machine over while it runs, so a Live that is left half way through its start is a problem
-# that comes back on every run.
-function Close-RunningLive() {
-  $running = @(Get-Process -Name 'Ableton Live*' -ErrorAction SilentlyContinue)
-  if ($running.Count -eq 0) { return }
+  $logStart = 0
+  if ($Log -and (Test-Path $Log)) { $logStart = (Get-Item $Log).Length }
 
-  $pids = @($running | ForEach-Object { $_.Id })
-  Debug-Log "closing Live that is still running (pids: $($pids -join ','))"
-  Close-VisibleWindowsForPids $pids
+  $context = New-RunContext -LogStart $logStart
+  $state = New-RunState
 
-  $deadline = (Get-Date).AddSeconds(5)
-  while ((Get-Date) -lt $deadline) {
-    $messages = [regex]::Matches((Read-Log $logStart), 'Message Box: (.*)')
-    if ($messages.Count -gt 0 -and $messages[$messages.Count - 1].Groups[1].Value -match 'Save changes') {
-      [void](Send-KeyToWindows $pids 'n')
-    }
-    $remaining = @(Get-Process -Name 'Ableton Live*' -ErrorAction SilentlyContinue)
-    if ($remaining.Count -eq 0) { return }
-    Start-Sleep -Milliseconds 200
+  Invoke-PreRunCleanup $context
+  Start-Sleep -Milliseconds 250
+
+  $argumentList = @()
+  if ($Set) { $argumentList = @($Set) }
+
+  $process = Start-Application $Exe $argumentList $Visibility
+  $context.Process = $process
+  if ($null -eq $process) {
+    # The application was not started, because a permission prompt is waiting.
+    $state.Updater = $true
+  } elseif ($PidFile) {
+    # The pid of the application is written down, so that a run that is cut short from the
+    # outside still knows what to stop.
+    Set-Content -Path $PidFile -Value $process.Id -Encoding ascii
   }
 
-  Get-Process -Name 'Ableton Live*' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-}
+  # When the set was written last, so that the write of the application can be told apart from
+  # the set that was there before.
+  if ($Set -and (Test-Path $Set)) { $context.SetWriteTime = (Get-Item $Set).LastWriteTime }
 
-$logStart = 0
-if ($Log -and (Test-Path $Log)) { $logStart = (Get-Item $Log).Length }
+  try {
+    while ((Get-Date) -lt $context.Deadline) {
+      # The application was not started, because a permission prompt is waiting. There is
+      # nothing to watch for.
+      if ($null -eq $process) { break }
 
-Close-RunningLive
-Cleanup-Notepad
-Start-Sleep -Milliseconds 250
+      Start-Sleep -Milliseconds 200
+      $context.ProcessIds = @(Get-ProcessTreeIds @($process.Id))
+      Debug-Log "process tree: $($context.ProcessIds -join ',')"
+      $running = @($context.ProcessIds | ForEach-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
+      if ($running.Count -eq 0) { break }
 
-$dialog = $null
-$recovered = $false
-$crashed = $false
-$saved = ''
-$updater = $false
-$lastMessage = $null
-$dismissed = @()
-
-$argumentList = @()
-if ($Set) { $argumentList = @($Set) }
-$windowStyle = switch ($Visibility) {
-  'hidden' { 'Normal' }
-  'minimized' { 'Normal' }
-  default { 'Normal' }
-}
-
-# A permission prompt of the installer of Ableton is on the secure desktop, where nothing of
-# the session can answer it. Live waits for that permission, and every Live that is started
-# while a prompt is waiting leaves another prompt behind. So Live is not started at all while
-# a prompt is waiting, and the run is reported as blocked by the installer.
-$pendingPrompts = @(Get-PermissionPrompts)
-$process = $null
-if (Test-WaitsForPermission $Exe $pendingPrompts) {
-  $updater = $true
-  Debug-Log "a prompt is asking for permission ($($pendingPrompts.Count) of them); Live is not started"
-} else {
-  $process = Start-Process -FilePath $Exe -ArgumentList $argumentList -PassThru -WindowStyle $windowStyle
-  if ($Visibility -ne 'normal') { Set-ProcessWindowVisibility $process.Id $Visibility }
-
-  # The pid of the application is written down, so that a run that is cut short from the outside
-  # still knows what to stop. A Live that is left running goes on by itself, and it takes the
-  # machine over when it checks for package installation.
-  if ($PidFile) { Set-Content -Path $PidFile -Value $process.Id -Encoding ascii }
-}
-
-# When the set was written last, so that the write of the application can be told apart from
-# the set that was there before.
-$setWriteTime = [datetime]::MinValue
-if ($Set -and (Test-Path $Set)) { $setWriteTime = (Get-Item $Set).LastWriteTime }
-
-# The installer helper of Ableton is given this many seconds to do its work before it is
-# dismissed.
-$helperWaitSeconds = 10
-$helperSeenAt = $null
-$deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-$cleanupPids = @()
-if ($process) { $cleanupPids = @($process.Id) }
-
-# The keys that dismiss the recovery prompt of Live, in the order they are tried.
-$recoveryKeys = @('n', 'esc')
-$recoveryAttempt = 0
-$recoveryKeySentAt = $null
-
-try {
-  while ((Get-Date) -lt $deadline) {
-    # The application was not started, because a permission prompt is waiting. There is
-    # nothing to watch for.
-    if ($null -eq $process) { break }
-
-    Start-Sleep -Milliseconds 200
-    $cleanupPids = @(Get-ProcessTreeIds @($process.Id))
-    Debug-Log "process tree: $($cleanupPids -join ',')"
-    $running = @($cleanupPids | ForEach-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
-    if ($running.Count -eq 0) { break }
-
-    # The installer helper of Ableton blocks the machine while it runs, and Live waits for it,
-    # so the set is never loaded while the helper is up. The helper is given ten seconds to do
-    # its work, and is dismissed after that, so that the screen of the machine is free again.
-    $helpers = @(Get-InstallHelpers)
-    $prompts = @(Get-PermissionPrompts)
-    if (Test-WaitsForPermission $Exe $prompts) {
-      # A prompt is asking for permission, and the prompt is where nothing can reach it, so it
-      # cannot be answered here. Live waits for the permission, and the set is not loaded
-      # until it is given. The run is reported as blocked, so that the wait is not mistaken
-      # for a set that was loaded.
-      $updater = $true
-      Debug-Log "a prompt is asking for permission ($($prompts.Count) of them); Live waits for it"
-      break
-    }
-    if ($helpers.Count -gt 0) {
-      $updater = $true
-      if ($null -eq $helperSeenAt) { $helperSeenAt = Get-Date }
-      $helperPids = @($helpers | ForEach-Object { $_.Id })
-      $waiting = ((Get-Date) - $helperSeenAt).TotalSeconds
-      Debug-Log "InstallHelper is running (pids: $($helperPids -join ',')); waiting ${waiting}s"
-      if ($waiting -ge $helperWaitSeconds) {
-        Debug-Log "dismissing InstallHelper"
-        foreach ($helper in $helpers) {
-          # The helper is not a Qt window, so a posted key does not reach it: the escape is
-          # typed to the window that has the focus.
-          [void](Send-DismissKey $helper.Id '{ESC}')
-          foreach ($window in Get-Windows $helper.Id) {
-            [void][Live]::PostMessage($window.Handle, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
-          }
-        }
-        # Live gets the time it needs to load the set, now that the machine is free again.
-        $deadline = $deadline.AddSeconds($waiting)
-        $helperSeenAt = $null
-      }
-    } else {
-      $helperSeenAt = $null
-    }
-
-    $text = Read-Log $logStart
-
-    # Live says in its log when it checks for packages, which it does on every start. The
-    # check itself is not the updater: the updater is the helper that does the installing, and
-    # the helper is a process of its own.
-    if ($text -match 'Check for package installation') {
-      Debug-Log 'Live is checking for package installation'
-    }
-
-    # A dialog of the standard class holds the text of its message in the controls that hold
-    # static text, and it holds the buttons that answer it. The button that answers it is
-    # pressed, so that the dialog goes away the way a person would make it go away.
-    foreach ($messageDialog in Find-MessageDialogs $cleanupPids) {
-      $messageText = $messageDialog.Text
-      if ($messageText -eq $lastMessage) { continue }
-
-      if ($messageText -match 'serious program error|fatal error|shut down after this message box') {
-        $dialog = $messageText
-        $crashed = $true
-        $lastMessage = $messageText
-        continue
-      }
-
-      $lastMessage = $messageText
-      $dismissed += $messageText
-      Debug-Log "the dialog says: $messageText"
-
-      $button = $messageDialog.Buttons | Where-Object { $_.Title -match '^(OK|&OK)$' } | Select-Object -First 1
-      if ($null -eq $button) {
-        $button = $messageDialog.Buttons | Where-Object { $_.Title -match '^(No|&No)$' } | Select-Object -First 1
-      }
-      if ($null -ne $button) {
-        Debug-Log "pressing the '$($button.Title)' button of the dialog"
-        [void](Press-Button $button)
-      } else {
-        # The dialog has no button that is known, so the key that closes it is sent to the
-        # window that has the focus.
-        Debug-Log 'the dialog has no known button, sending the escape to the foreground'
-        [void](Send-DismissKey $process.Id '{ESC}')
-      }
-    }
-
-    # Live writes the text of its message boxes to its log, and its dialogs are Qt windows that
-    # UI Automation sees nothing in, so the log is where a dialog of Live is read from.
-    $messages = [regex]::Matches($text, 'Message Box: (.*)')
-    if ($messages.Count -gt 0) {
-      $message = $messages[$messages.Count - 1].Groups[1].Value.Trim()
-      if ($message -match 'recover your work') {
-        # The recovery prompt holds the set back: the document is not loaded until it is gone.
-        # The key goes to the windows of Live as soon as the prompt is seen, and again with the
-        # next key when the prompt is still there.
-        if ($recoveryAttempt -lt $recoveryKeys.Count) {
-          $key = $recoveryKeys[$recoveryAttempt]
-          $recoveryAttempt++
-          $recoveryKeySentAt = Get-Date
-          Debug-Log "dismissing the recovery prompt with $key"
-          [void](Send-KeyToWindows $cleanupPids $key)
-        } else {
-          if ($null -ne $recoveryKeySentAt -and
-              ((Get-Date) - $recoveryKeySentAt).TotalSeconds -ge 1) {
-            # The prompt did not go away. It is the window that has the focus that is dismissed,
-            # so the app is brought to the foreground and the key is sent to it.
-            $recoveryKeySentAt = Get-Date
-            Debug-Log "dismissing the recovery prompt with the foreground"
-            [void](Send-DismissKey $process.Id 'n')
-          }
-        }
-      } else {
-        if ($message -ne $lastMessage) {
-          $lastMessage = $message
-          if ($message -match 'serious program error|fatal error|shut down after this message box') {
-            $dialog = $message
-            $crashed = $true
-          } else {
-            # A message box that is not fatal is dismissed, so that the set can still be loaded.
-            # Live puts up a box of its own when a plugin cannot be loaded, and that box holds
-            # the set back as long as it is there.
-            $dismissed += $message
-            Debug-Log "dismissing the message box: $message"
-            [void](Send-KeyToWindows $cleanupPids 'esc')
-          }
-        }
-      }
-    }
-    if ($text -match 'Begin ExchangeDocument') { $recovered = $true }
-    if ($text -match 'Exception: Fatal Error') { $crashed = $true }
-
-    # Live says that it has loaded the document it was given even when the document could not
-    # be loaded, so the failure is looked for first. A set that is not loaded is not saved.
-    $failure = [regex]::Match($text, 'Failed to load command-line document: (.*)')
-    if ($failure.Success) {
-      $dialog = $failure.Groups[1].Value.Trim()
-      Debug-Log "the document was not loaded: $dialog"
-      break
-    }
-
-    # The set is loaded when Live says that it has loaded the document it was given. Live says
-    # it twice over: once for the document of the start, and once for the document of the
-    # command line. The last one is the set that was asked for.
-    #
-    # The log is what says when the set is loaded, so a set that takes a long time to load is
-    # waited for as long as it takes, and a set that loads quickly is not waited for at all.
-    if ($text -match 'Loading command-line document: done\.') {
-      # The set is loaded. It is saved here, because the save is what the caller asked for, and
-      # the set is the thing Live has open.
-      if ($SaveInPlace) {
-        Debug-Log "the set will be saved when Live is closed: $Set"
-      } else {
-        if ($SavePath -and -not $saved) {
-          Debug-Log "saving the set to $SavePath"
-          $saved = Save-Document $process.Id $cleanupPids $SavePath
-          Debug-Log "saved: $saved"
-        }
-      }
-      break
-    }
-
-    foreach ($processId in $cleanupPids) {
-      $windows = @(Get-Windows $processId)
-      Debug-Log "visible windows for PID ${processId}: $($windows.Count)"
-      foreach ($window in $windows) {
-        $dialogElement = Get-DialogElement $window.Handle
-        $shown = Get-DialogText $dialogElement
-        Debug-Log "window PID=$processId class=$($window.Class) title=$($window.Title) text=$shown"
-        if (-not $shown) { continue }
-
-        $dialogInfo = Get-DialogInfo $shown
-        $dialog = $shown
-
-        if ($dialogInfo.Type -eq 'fatal') {
-          $crashed = $true
-          if (Click-Button $dialogElement $dialogInfo.Action) { }
+      # A prompt that asks for permission is on the secure desktop, where nothing of the
+      # session can answer it. The application waits for the permission, and the set is not
+      # loaded until it is given, so the run waits for the answer.
+      $prompts = @(Get-PermissionPrompts)
+      if (Test-WaitsForPermission $Exe $prompts) {
+        $state.Updater = $true
+        if ($null -eq $state.PermissionSeenAt) { $state.PermissionSeenAt = Get-Date }
+        $waiting = ((Get-Date) - $state.PermissionSeenAt).TotalSeconds
+        Debug-Log "a prompt is asking for permission ($($prompts.Count) of them); waiting ${waiting}s"
+        if ($waiting -ge 10) {
+          # The prompt was not answered. The run is reported as blocked, so that the wait is
+          # not mistaken for a set that was loaded.
+          Debug-Log 'the prompt was not answered; the run is blocked'
           break
         }
-
-        if ($dialogInfo.Type -eq 'recovery') {
-          if (Click-Button $dialogElement $dialogInfo.Action) {
-            $recovered = $true
-            $dialog = $null
-            break
-          }
-        }
-
-        if ($dialogInfo.Type -eq 'save_changes') {
-          if (Click-Button $dialogElement $dialogInfo.Action) { }
-        }
-
-        if ($dialogInfo.Type -and $dialogInfo.Type -ne 'unknown') { break }
+        # The application gets the time it needs to load the set, when the prompt is answered.
+        $context.Deadline = $context.Deadline.AddSeconds(0.2)
+        continue
       }
-      if ($dialog) { break }
-    }
+      $state.PermissionSeenAt = $null
 
-    if ($dialog) { break }
-    if ($recovered) { continue }
-  }
+      Update-RunState $state $context
 
-  $cleanupPids = @(Get-ProcessTreeIds @($process.Id))
-  foreach ($processId in $cleanupPids) {
-    foreach ($window in Get-Windows $processId) {
-      $dialogElement = Get-DialogElement $window.Handle
-      $shown = Get-DialogText $dialogElement
-      if ($shown -and $shown -notmatch 'serious program error|fatal error') {
-        if (Click-Button $dialogElement 'OK') { }
-        elseif (Click-Button $dialogElement 'No') { }
-        elseif (Click-Button $dialogElement 'Yes') { }
-      }
+      if ($state.Done) { break }
+      if ($state.Dialog) { break }
+      if ($state.Recovered) { continue }
     }
   }
-}
-finally {
-  $cleanupPids = @(Get-ProcessTreeIds @($process.Id))
-  $cleanupPids += @(Get-InstallHelpers | ForEach-Object { $_.Id })
-  Close-VisibleWindowsForPids $cleanupPids
-
-  # Live asks whether to save the set when it is closed. The set is a test, so the answer is
-  # no, unless the caller asked for the set to be saved. Live that is closed this way leaves no
-  # crash recovery state behind, and the next run starts without a recovery prompt.
-  $closeDeadline = (Get-Date).AddSeconds(5)
-  while ((Get-Date) -lt $closeDeadline) {
-    $messages = [regex]::Matches((Read-Log $logStart), 'Message Box: (.*)')
-    if ($messages.Count -gt 0 -and $messages[$messages.Count - 1].Groups[1].Value -match 'Save changes') {
-      if ($SaveInPlace) {
-        Debug-Log 'answering the save prompt with yes'
-        [void](Send-KeyToWindows @(Get-ProcessTreeIds @($process.Id)) 'y')
-      } else {
-        [void](Send-KeyToWindows @(Get-ProcessTreeIds @($process.Id)) 'n')
-      }
-    }
-    $running = @(Get-ProcessTreeIds @($process.Id) | ForEach-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
-    if ($running.Count -eq 0) { break }
-    Start-Sleep -Milliseconds 200
+  finally {
+    if ($null -ne $process) { $context.ProcessIds = @(Get-ProcessTreeIds @($process.Id)) }
+    $context.ExtraPids += @(Get-ExtraProcessIds)
+    Invoke-ShutdownLadder $context
+    Cleanup-Notepad
+    if ($PidFile -and (Test-Path $PidFile)) { Remove-Item $PidFile -Force -ErrorAction SilentlyContinue }
   }
 
-  # The set is written while Live is closing, so Live is not killed before it is written.
-  if ($SaveInPlace -and -not $saved) {
-    $saved = Wait-ForSet $Set $setWriteTime
-    Debug-Log "saved: $saved"
+  $dialog = Get-BlockedDialog $state
+  if ($dialog) { Write-Output ('DIALOG: ' + $dialog) } else { Write-Output 'DIALOG: none' }
+  if ($dialog) {
+    $dialogInfo = Get-DialogInfo $dialog
+    if ($dialogInfo.Type) { Write-Output ('DIALOG_TYPE: ' + $dialogInfo.Type) }
+    if ($dialogInfo.Action) { Write-Output ('DISMISS_ACTION: ' + $dialogInfo.ActionType + '=' + $dialogInfo.ActionValue) }
+  } else {
+    Write-Output 'DIALOG_TYPE: none'
+    Write-Output 'DISMISS_ACTION: none'
+  }
+  if ($state.Crashed) { Write-Output 'CRASHED: yes' } else { Write-Output 'CRASHED: no' }
+  if ($state.Updater) { Write-Output 'UPDATER: yes' } else { Write-Output 'UPDATER: no' }
+  if ($context.ExitedCleanly) { Write-Output 'EXITED_CLEANLY: yes' } else { Write-Output 'EXITED_CLEANLY: no' }
+
+  # The update that is waiting to be installed. The application installs it when it exits, so
+  # a run that ends with a clean exit installs it.
+  $pendingUpdate = Get-PendingUpdate (Read-Log $Log 0)
+  if ($pendingUpdate) { Write-Output ('PENDING_UPDATE: ' + $pendingUpdate) }
+
+  foreach ($message in $state.Dismissed) { Write-Output ('MESSAGE: ' + $message) }
+  if ($state.Recovered) { Write-Output 'RECOVERED: yes' } else { Write-Output 'RECOVERED: no' }
+  if ($SavePath) {
+    if ($context.Saved) { Write-Output 'SAVED: yes' } else { Write-Output 'SAVED: no' }
+    if ($context.Saved) { Write-Output ('SAVED_PATH: ' + $context.Saved) } else { Write-Output ('SAVED_PATH: ' + $SavePath) }
   }
 
-  Stop-ProcessTree $cleanupPids
-  Cleanup-Notepad
-  if ($PidFile -and (Test-Path $PidFile)) { Remove-Item $PidFile -Force -ErrorAction SilentlyContinue }
-}
-
-if ($updater -and -not $dialog) {
-  $dialog = 'Live is installing packages: the installer takes over the machine and Live waits for it'
-}
-
-if ($dialog) { Write-Output ('DIALOG: ' + $dialog) } else { Write-Output 'DIALOG: none' }
-if ($dialog) {
-  $dialogInfo = Get-DialogInfo $dialog
-  if ($dialogInfo.Type) { Write-Output ('DIALOG_TYPE: ' + $dialogInfo.Type) }
-  if ($dialogInfo.Action) { Write-Output ('DISMISS_ACTION: ' + $dialogInfo.ActionType + '=' + $dialogInfo.ActionValue) }
-} else {
-  Write-Output 'DIALOG_TYPE: none'
-  Write-Output 'DISMISS_ACTION: none'
-}
-if ($crashed) { Write-Output 'CRASHED: yes' } else { Write-Output 'CRASHED: no' }
-if ($updater) { Write-Output 'UPDATER: yes' } else { Write-Output 'UPDATER: no' }
-foreach ($message in $dismissed) { Write-Output ('MESSAGE: ' + $message) }
-if ($recovered) { Write-Output 'RECOVERED: yes' } else { Write-Output 'RECOVERED: no' }
-if ($SavePath) {
-  if ($saved) { Write-Output 'SAVED: yes' } else { Write-Output 'SAVED: no' }
-  if ($saved) { Write-Output ('SAVED_PATH: ' + $saved) } else { Write-Output ('SAVED_PATH: ' + $SavePath) }
-}
-
-Write-Output '--- LOG ---'
-Write-Output (Read-Log $logStart)
+  Write-Output '--- LOG ---'
+  Write-Output (Read-Log $Log $logStart)
 
 }
-
-if ($MyInvocation.InvocationName -ne '.') { Invoke-Main }

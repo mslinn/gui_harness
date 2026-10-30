@@ -1,14 +1,13 @@
 # frozen_string_literal: false
 
 require 'spec_helper'
-require 'stringio'
 require 'tempfile'
 
 # The expressions the examples ask the PowerShell script for.
 #
 # Every expression is evaluated in the same PowerShell process, because starting one costs
 # more than the expression does.
-EXPRESSIONS = {
+GENERIC_EXPRESSIONS = {
   'key_n'        => "Get-KeyCode 'n'",
   'key_esc'      => "Get-KeyCode 'esc'",
   'key_enter'    => "Get-KeyCode 'enter'",
@@ -18,14 +17,12 @@ EXPRESSIONS = {
   'recovery'     => "(Get-DialogInfo 'Would you like to recover your work?').Type",
   'save_changes' => "(Get-DialogInfo 'Save changes?').Type",
   'error'        => "(Get-DialogInfo 'The system cannot find the path specified.').Type",
-  'updater'      => "(Get-DialogInfo 'Live is installing packages').Type",
-  'unknown'      => "(Get-DialogInfo 'Some unexpected Live window').Type",
+  'unknown'      => "(Get-DialogInfo 'Some unexpected window').Type",
   'save_action'  => "(Get-DialogInfo 'Save changes?').Action",
   'error_action' => "(Get-DialogInfo 'The system cannot find the path specified.').Action",
-  'no_helper'    => "@(Get-InstallHelpers -Names 'no_such_process_xyz').Count",
 }.freeze
 
-RSpec.describe GuiHarness::LiveLauncher do
+RSpec.describe GuiHarness::Generic::Launcher do
   # The number of Notepad processes Windows is running.
   #
   # @return [Integer] the number of them
@@ -36,14 +33,14 @@ RSpec.describe GuiHarness::LiveLauncher do
     `#{command}`.strip.to_i
   end
 
-  # The path of the PowerShell script of the launcher.
+  # The path of the PowerShell script of the generic layer.
   #
   # @return [String] the path
   def script_path
-    File.expand_path '../../assets/gui_harness_live_launcher.ps1', __dir__
+    File.expand_path '../../../assets/generic/run.ps1', __dir__
   end
 
-  # Runs an expression against the PowerShell script of the launcher.
+  # Runs an expression against the PowerShell script of the generic layer.
   #
   # The script is dot-sourced, so that its functions are there without the script launching
   # anything. The parameters of the script are given, because they are mandatory.
@@ -63,8 +60,7 @@ RSpec.describe GuiHarness::LiveLauncher do
         { type: :fatal, action: { type: 'button', value: 'OK' } }
       )
 
-      msg = "Live unexpectedly quit while you were working on the Live Set 'Untitled'. Would you like to recover your work?"
-      expect(described_class.classify_dialog(msg)).to eq(
+      expect(described_class.classify_dialog('Would you like to recover your work?')).to eq(
         { type: :recovery, action: { type: 'button', value: 'No' } }
       )
 
@@ -77,7 +73,13 @@ RSpec.describe GuiHarness::LiveLauncher do
         { type: :error, action: { type: 'button', value: 'OK' } }
       )
 
-      expect(described_class.classify_dialog('Some unexpected Live window')).to eq(
+      expect(described_class.classify_dialog('Some unexpected window')).to eq(
+        { type: :unknown, action: nil }
+      )
+    end
+
+    it 'knows nothing of the dialogs of Live' do
+      expect(described_class.classify_dialog('Live is installing packages')).to eq(
         { type: :unknown, action: nil }
       )
     end
@@ -137,6 +139,16 @@ RSpec.describe GuiHarness::LiveLauncher do
     end
   end
 
+  describe '.command' do
+    it 'hands the rungs of the ladder of the layer to the sidecar' do
+      args = described_class.command 'notepad.exe', 'C:/missing.txt'
+
+      expect(args).to include('-ShutdownRungs')
+      expect(args[args.index('-ShutdownRungs') + 1]).to eq(described_class.shutdown_rungs.join(','))
+      expect(described_class.shutdown_rungs).to eq(GuiHarness::Generic::Shutdown::RUNGS)
+    end
+  end
+
   describe '.launch' do
     it 'opens Notepad from WSL with a missing file and surfaces the real Windows error dialog quickly' do
       missing_path = 'C:/path/that/does/not/exist/notepad-demo.txt'
@@ -173,6 +185,7 @@ RSpec.describe GuiHarness::LiveLauncher do
       expect(result.crashed).to be(false)
       expect(result.outcome).to eq(:loaded)
       expect(result.success?).to be(true)
+      expect(result.exited_cleanly).to be(true)
 
       expect(notepad_process_count).to eq(0) if Gem.win_platform?
     ensure
@@ -187,8 +200,8 @@ RSpec.describe GuiHarness::LiveLauncher do
     # @return [Hash] the values, by the name of the expression
     def self.values
       @values ||= begin
-        script = described_class.windows_path File.expand_path('../../assets/gui_harness_live_launcher.ps1', __dir__)
-        body = EXPRESSIONS.map do |name, expression|
+        script = described_class.windows_path File.expand_path('../../../assets/generic/run.ps1', __dir__)
+        body = GENERIC_EXPRESSIONS.map do |name, expression|
           "Write-Output ('#{name}=' + (#{expression}))"
         end.join('; ')
         command = 'powershell.exe -NoProfile -Command ' \
@@ -213,26 +226,12 @@ RSpec.describe GuiHarness::LiveLauncher do
       expect(self.class.values['recovery']).to eq('recovery')
       expect(self.class.values['save_changes']).to eq('save_changes')
       expect(self.class.values['error']).to eq('error')
-      expect(self.class.values['updater']).to eq('updater')
       expect(self.class.values['unknown']).to eq('unknown')
     end
 
     it 'names the button that dismisses a dialog' do
       expect(self.class.values['save_action']).to eq('No')
       expect(self.class.values['error_action']).to eq('OK')
-    end
-
-    it 'finds the installer helper of Ableton by its process name' do
-      expect(self.class.values['no_helper']).to eq('0')
-    end
-
-    it 'finds a process that is running' do
-      system 'powershell.exe', '-NoProfile', '-Command', 'Start-Process notepad.exe'
-      sleep 1
-
-      expect(powershell("@(Get-InstallHelpers -Names 'notepad').Count").strip.to_i).to be >= 1
-    ensure
-      system 'powershell.exe', '-NoProfile', '-Command', 'Stop-Process -Name notepad -Force -ErrorAction SilentlyContinue'
     end
   end
 
@@ -301,25 +300,6 @@ RSpec.describe GuiHarness::LiveLauncher do
       expect(result.outcome).to eq(:crashed)
       expect(result.crashed).to be true
       expect(result.loaded).to be false
-    end
-
-    it 'reports a run that was blocked by the installer of Ableton' do
-      output = <<~TEXT
-        DIALOG: Live is installing packages: the installer takes over the machine and Live waits for it
-        DIALOG_TYPE: updater
-        DISMISS_ACTION: none
-        CRASHED: no
-        UPDATER: yes
-        --- LOG ---
-        Live App: Check for package installation
-      TEXT
-
-      status = Struct.new(:exitstatus, keyword_init: true).new(exitstatus: 0)
-      result = described_class.send(:parse, output, status)
-
-      expect(result.updater).to be true
-      expect(result.dialog_type).to eq(:updater)
-      expect(result.outcome).to eq(:blocked)
     end
 
     it 'reports a run in which nothing blocked the application' do

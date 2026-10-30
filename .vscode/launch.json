@@ -15,7 +15,7 @@
     },
     {
       "name": "Quick Notepad probe",
-      "program": "ruby -Ilib -e 'require \"gui_harness\"; result = GuiHarness::LiveLauncher.launch(\"notepad.exe\", \"C:/path/that/does/not/exist/notepad-demo.txt\", timeout: 3); pp result.to_h'",
+      "program": "ruby -Ilib -e 'require \"gui_harness\"; result = GuiHarness::Generic::Launcher.launch(\"notepad.exe\", \"C:/path/that/does/not/exist/notepad-demo.txt\", timeout: 3); pp result.to_h'",
       "request": "launch",
       "type": "ruby_lsp"
     },

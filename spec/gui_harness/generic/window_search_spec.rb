@@ -10,14 +10,14 @@ require 'tempfile'
 # dialog belongs to a PowerShell process of its own, and the script is asked about that
 # process, so that the windows it holds are the windows of that process and of no other.
 RSpec.describe 'the window search of the PowerShell script' do
-  # The path of the PowerShell script of the launcher.
+  # The path of the PowerShell script of the generic layer.
   #
   # @return [String] the path
   def script_path
-    File.expand_path '../../assets/gui_harness_live_launcher.ps1', __dir__
+    File.expand_path '../../../assets/generic/run.ps1', __dir__
   end
 
-  # Runs an expression against the PowerShell script of the launcher.
+  # Runs an expression against the PowerShell script of the generic layer.
   #
   # The script is dot-sourced, so that its functions are there without the script launching
   # anything. The parameters of the script are given, because they are mandatory.
@@ -28,7 +28,7 @@ RSpec.describe 'the window search of the PowerShell script' do
   # @param expression [String] the PowerShell expression to run
   # @return [String] the output of the expression
   def powershell(expression)
-    script = GuiHarness::LiveLauncher.windows_path script_path
+    script = GuiHarness::Generic::Launcher.windows_path script_path
     command = ". '#{script}' -Exe notepad.exe -Set C:/missing.txt; #{expression}"
     output, = Open3.capture2e 'powershell.exe', '-NoProfile', '-Command', command
     output
@@ -45,7 +45,7 @@ RSpec.describe 'the window search of the PowerShell script' do
   def start_dialog(kind)
     pid_file = Tempfile.new(['gui_harness_window_search', '.pid'])
     pid_file.close
-    path = GuiHarness::LiveLauncher.windows_path pid_file.path
+    path = GuiHarness::Generic::Launcher.windows_path pid_file.path
 
     body = case kind
            when :file

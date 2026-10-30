@@ -6,7 +6,7 @@ A Ruby harness for real GUI automation and end-to-end compatibility testing.
 
 `gui_harness` is a small library for driving real desktop applications the way a user does: launch the actual process, inspect the windows it owns, read the visible dialog text, classify the modal state, dismiss the blocking prompt, and return a structured result for tests.
 
-This project is intentionally not a log-only parser. The process-owned window probe is the source of truth. The harness treats the UI as the contract.
+This project is intentionally not a log-only parser. The process-owned window probe is the source of truth for the dialogs of the applications that expose their windows; the dialogs of Live are read from Live's own log, because Live is a Qt application and exposes no names for its windows. The harness treats the UI as the contract, and says so where the UI says nothing.
 
 The harness is designed for the real WSL-to-Windows workflow: Ruby runs in WSL, then the target GUI is launched by PowerShell on Windows. The launcher script is treated as a deployed runtime asset, not as Ruby source code.
 
@@ -48,7 +48,7 @@ require 'gui_harness'
 result = GuiHarness::LiveLauncher.launch(
   'C:/Program Files/Ableton/Live 12 Suite/Program/Ableton Live 12 Suite.exe',
   'C:/path/to/test.als',
-  timeout: 120
+  timeout: 13
 )
 
 puts result.exit_code
@@ -85,6 +85,10 @@ The launch result is a Ruby `Struct` with the following fields:
 - `log`
 - `loaded`
 - `crashed`
+- `saved`
+- `saved_path`
+- `updater`
+- `messages`
 
 It also exposes a derived `outcome` method:
 
@@ -94,6 +98,22 @@ It also exposes a derived `outcome` method:
 - `:unknown`
 
 This keeps a real GUI run easy to assert in Ruby specs without exposing raw UIAutomation internals.
+
+## When the set is loaded
+
+The harness does not wait for a fixed time and hope. Live writes to its log when it has loaded the
+document it was given, and the harness waits for that line: `Loading command-line document: done.`
+A set that takes a long time to load is waited for as long as it takes, and a set that loads
+quickly is not waited for at all. Live writes that line even when the document could not be
+loaded, so the harness also looks for `Failed to load command-line document`, and a set that was
+not loaded is never reported as loaded.
+
+## When Live waits for permission
+
+Live's installer asks for permission before it registers the file types of Live, and the prompt
+is on the secure desktop, where no program of the session can reach it. Live waits for that
+permission, and the set is not loaded until it is given. The harness cannot answer the prompt,
+so it reports the run as blocked by the installer rather than as a set that was loaded.
 
 ## Real-world usage
 
@@ -145,7 +165,7 @@ bundle exec rspec
 Run the focused GUI harness spec:
 
 ```bash
-bundle exec rspec spec/live_launcher_spec.rb --format documentation
+bundle exec rspec spec/gui_harness/live_launcher_spec.rb --format documentation
 ```
 
 ## Testing philosophy

@@ -1069,6 +1069,44 @@ function Invoke-PreRunCleanup($Context) {
   Invoke-PreRunCleanup-Generic $Context
 }
 
+# The registration of the application.
+#
+# A generic program has no registration of its own to set up, so the generic layer does
+# nothing here. A program that has one — Live, for instance — overrides this seam.
+#
+# @param Context the run that is starting
+# @return [bool] whether anything was written
+function Set-ApplicationRegistration-Generic($Context) {
+  return $false
+}
+
+# The seam of the registration of the application.
+#
+# @param Context the run that is starting
+# @return [bool] whether anything was written
+function Set-ApplicationRegistration($Context) {
+  return (Set-ApplicationRegistration-Generic $Context)
+}
+
+# The registration of the application, as it was before the run.
+#
+# A generic program has no registration of its own, so the generic layer does nothing here.
+# A program that has one — Live, for instance — overrides this seam.
+#
+# @param Context the run that is over
+# @return [bool] whether anything was written
+function Restore-ApplicationRegistration-Generic($Context) {
+  return $false
+}
+
+# The seam of the registration of the application, as it was before the run.
+#
+# @param Context the run that is over
+# @return [bool] whether anything was written
+function Restore-ApplicationRegistration($Context) {
+  return (Restore-ApplicationRegistration-Generic $Context)
+}
+
 # The facts about the run, as the run state holds them.
 #
 # @return [object] the run state
@@ -1106,12 +1144,14 @@ function New-RunContext([long]$LogStart = 0) {
     ApplicationGone = $false
     CleanExitConfirmed = $false
     Deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    Exe = $Exe
     ExitedCleanly = $false
     ExtraPids = @()
     Log = $Log
     LogStart = $LogStart
     Process = $null
     ProcessIds = @()
+    RegistrationWritten = $false
     Saved = ''
     SaveInPlace = [bool]$SaveInPlace
     SavePath = $SavePath
@@ -1347,6 +1387,10 @@ function Invoke-Main {
   $argumentList = @()
   if ($Set) { $argumentList = @($Set) }
 
+  # The registration of the application is set up before it starts, so that the application
+  # does not have to ask to be promoted when it starts.
+  Set-ApplicationRegistration $context
+
   $process = Start-Application $Exe $argumentList $Visibility
   $context.Process = $process
   if ($null -eq $process) {
@@ -1407,6 +1451,7 @@ function Invoke-Main {
     $context.ExtraPids += @(Get-ExtraProcessIds)
     Invoke-ShutdownLadder $context
     Cleanup-Notepad
+    Restore-ApplicationRegistration $context
     if ($PidFile -and (Test-Path $PidFile)) { Remove-Item $PidFile -Force -ErrorAction SilentlyContinue }
   }
 

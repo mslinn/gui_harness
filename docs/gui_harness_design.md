@@ -27,6 +27,11 @@ Live: the first time a version runs it asks, and running it again does not ask, 
 accepted the first time. The Live layer does not start Live while a prompt is waiting, and
 reports the run as blocked by the installer rather than as a set that was loaded.
 
+The prompt that comes with that registration is the one that the `ableton:` protocol raises, and
+the Live layer keeps it away by writing a per-user registration that shadows the machine-wide
+one. The registration of the run is taken away when the run is over, and the registration of the
+machine applies again. That is in [elevation.md](elevation.md).
+
 Live writes a recovery point when it is killed, and holds the point in its Preferences folder,
 next to its log. The point is what drives the recovery prompt of the next launch, and Live holds
 the document back until the question is answered. The Live layer clears the point before it
@@ -182,6 +187,8 @@ when the layers are loaded stays the generic one, and every seam is therefore ca
 | `Get-SaveCandidatePaths` | the path and the path without its extension | the path, the path with `.als`, and the project folder of Live |
 | `Get-BlockedDialog` | the dialog that was found | Live's wording for the dialog of the installer |
 | `Get-ExtraProcessIds` | none | the installer helper of Ableton, which is not in the tree of Live |
+| `Set-ApplicationRegistration` | nothing | the per-user registration of the `ableton:` protocol, written only when the default names another version |
+| `Restore-ApplicationRegistration` | nothing | the registration of the run is taken away, and the registration of the machine applies again |
 
 A seam that is not called by name is not a seam: PowerShell has to resolve the command name when
 it is called, and a seam that was captured in a variable when the layers were loaded keeps the

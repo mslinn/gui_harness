@@ -238,6 +238,27 @@ switching to another version asks again for that version. Running a version agai
 provided the user accepted the first time. A version that has been authorized starts straight
 away, so a run against it is not held up at the start.
 
+## When Live asks to be promoted
+
+There is a second prompt, and it is the one that the `ableton:` protocol raises. Live rewrites
+the machine-wide registration of that protocol when it starts and finds that another version of
+Live ran last, and that rewrite is elevated, so the elevation is the prompt.
+
+The harness keeps the prompt away without any privilege. Windows resolves a registration from
+the per-user hive first, so the Live layer writes a per-user registration of the protocol that
+names the version it is about to run, and Live finds its own name there. Nothing is promoted,
+and the machine-wide registration is left alone.
+
+Nothing is written when the default already names the version that is wanted: when Live 12 is
+the default and the harness runs Live 12, the registration is left alone and the run is not
+disturbed at all.
+
+A run leaves the machine as it was: the per-user registration of the run is taken away when the
+run is over, and the registration of the machine applies again.
+
+The finding, the measurements it rests on, and the fallback if a future version of Live stops
+consulting the merged view are in [docs/elevation.md](docs/elevation.md).
+
 The command line that the harness gives to Live is the path of the program and the path of the
 set. There are no other arguments.
 

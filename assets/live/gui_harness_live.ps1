@@ -314,6 +314,145 @@ function Invoke-PreRunCleanup($Context) {
   Cleanup-Notepad
 }
 
+# The key of the per-user registration of the `ableton:` protocol.
+#
+# The registration is per-user, so that it can be written without any privilege.
+#
+# @return [string] the path of the key
+function Get-ProtocolHandlerKey {
+  return 'HKCU:\Software\Classes\ableton\Shell\open\command'
+}
+
+# The command that handles the `ableton:` protocol, as the shell resolves it.
+#
+# The shell resolves a registration from the per-user hive first and falls back to the
+# machine-wide hive, so a per-user registration shadows the machine-wide one.
+#
+# @return [string] the command, or an empty string when nothing handles the protocol
+function Get-EffectiveProtocolHandler {
+  $machineWide = 'HKLM:\SOFTWARE\Classes\ableton\Shell\open\command'
+  foreach ($path in @((Get-ProtocolHandlerKey), $machineWide)) {
+    if (-not (Test-Path -LiteralPath $path)) { continue }
+    $value = (Get-Item -LiteralPath $path).GetValue('')
+    if ($value) { return $value }
+  }
+  return ''
+}
+
+# The executable that a handler command runs.
+#
+# @param Command [string] the command of a handler
+# @return [string] the path of the executable, or an empty string when the command names none
+function Get-HandlerExecutable([string]$Command) {
+  if (-not $Command) { return '' }
+  $match = [regex]::Match($Command, '^\s*"?(?<exe>[^"]+\.exe)"?')
+  if (-not $match.Success) { return '' }
+  return $match.Groups['exe'].Value
+}
+
+# The version of an executable of Live.
+#
+# The version is the version of the file itself. The folder that holds the copy holds the
+# edition and not the version, so the folder cannot be read for it.
+#
+# @param Path the path of the executable
+# @return [version] the version, or $null when it cannot be read
+function Get-ExecutableVersion([string]$Path) {
+  if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return $null }
+  $file = Get-Item -LiteralPath $Path
+  if (-not $file.VersionInfo.FileVersion) { return $null }
+  try {
+    return [version]$file.VersionInfo.FileVersion
+  } catch {
+    return $null
+  }
+}
+
+# Whether a registration names the copy of Live that is wanted.
+#
+# A registration names a copy of Live when it names that executable, or when it names another
+# executable of the same version. The version is what matters to Live: a copy of the same
+# version is the same version of Live, wherever it is installed.
+#
+# @param Command the command of the registration
+# @param Exe the path of the executable that is wanted
+# @return [bool] whether the registration names it
+function Test-HandlerMatches([string]$Command, [string]$Exe) {
+  if (-not $Command -or -not $Exe) { return $false }
+
+  $handlerExe = Get-HandlerExecutable $Command
+  if (-not $handlerExe) { return $false }
+  if ($handlerExe -ieq $Exe) { return $true }
+
+  $handlerVersion = Get-ExecutableVersion $handlerExe
+  $exeVersion = Get-ExecutableVersion $Exe
+  if ($handlerVersion -and $exeVersion) { return ($handlerVersion -eq $exeVersion) }
+  return $false
+}
+
+# The registration of Live, as the Live layer sets it up.
+#
+# Live rewrites the machine-wide registration of the `ableton:` protocol when it starts and
+# finds that the registration names another version of Live. That key is machine-wide, so the
+# rewrite is elevated, and the elevation is the prompt of UAC.
+#
+# The shell resolves a registration from the per-user hive first, so a per-user registration
+# shadows the machine-wide one, and Live finds its own name there without anything being
+# promoted. The machine-wide registration is left alone.
+#
+# Nothing is written when the registration the machine would use already names the version of
+# Live that is about to run. The registration is written only when the default names another
+# version, which is the one time in which Live would ask to be promoted.
+#
+# @param Context [object] the run that is starting
+# @return [bool] whether anything was written
+function Set-ApplicationRegistration($Context) {
+  [void](Set-ApplicationRegistration-Generic $Context)
+
+  $exe = $Context.Exe
+  if (-not $exe) { return $false }
+
+  $default = Get-EffectiveProtocolHandler
+  if (Test-HandlerMatches $default $exe) {
+    Debug-Log "the default registration already names the version that is about to run"
+    return $false
+  }
+
+  $key = Get-ProtocolHandlerKey
+  New-Item -Path $key -Force -ErrorAction SilentlyContinue | Out-Null
+  Set-Item -Path $key -Value ('"' + $exe + '" "%1"') -ErrorAction SilentlyContinue
+  $Context.RegistrationWritten = $true
+  Debug-Log "the ableton protocol now names $exe"
+  return $true
+}
+
+# The registration of Live, as it is left when the run is over.
+#
+# The per-user registration of the run is taken away, and the registration of the machine
+# applies again, which is what a user expects of a machine that was only used for a test.
+#
+# Only the registration that the run wrote is taken away. A per-user registration that the
+# user made for themselves is left alone.
+#
+# @param Context [object] the run that is over
+# @return [bool] whether anything was written
+function Restore-ApplicationRegistration($Context) {
+  [void](Restore-ApplicationRegistration-Generic $Context)
+
+  if (-not $Context.RegistrationWritten) {
+    Debug-Log 'the run wrote no registration; nothing is taken away'
+    return $false
+  }
+
+  $key = Get-ProtocolHandlerKey
+  if (-not (Test-Path -LiteralPath $key)) { return $false }
+
+  Remove-Item -LiteralPath $key -Force -ErrorAction SilentlyContinue
+  $Context.RegistrationWritten = $false
+  Debug-Log 'the registration of the run was removed; the registration of the machine applies again'
+  return $true
+}
+
 # Live's pending recovery point.
 #
 # Live writes a recovery point when it is killed, and it holds the point in its Preferences

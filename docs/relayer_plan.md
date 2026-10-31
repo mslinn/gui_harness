@@ -108,6 +108,11 @@ a one-line delegation. The Live library redefines the seam name and delegates ba
 | `Get-PendingUpdate` | `''` | `auto-update available:` against `Init: Version: 'Live …'` |
 | `Invoke-PreRunCleanup` | nothing | `Close-RunningLive` |
 | `Get-SaveCandidatePaths` | the path and the path without its extension | the path, the path with `.als`, and `<name> Project/<name>.als` |
+| `Set-ApplicationRegistration` | nothing | the per-user registration of the `ableton:` protocol, written only when the default names another version |
+| `Restore-ApplicationRegistration` | nothing | the registration of the run is taken away, and the registration of the machine applies again |
+
+The last two seams are described in [elevation.md](elevation.md), which holds the finding they
+rest on.
 
 ## The ladder
 
@@ -208,9 +213,11 @@ refers to) and `live_set/TODO.md` if it names the old constant.
 - `lib/gui_harness/live_launcher.rb` — deleted
 - `lib/gui_harness.rb` — requires the two layers
 - `spec/gui_harness/generic/*_spec.rb`, `spec/gui_harness/live/*_spec.rb` — the specs follow the layers
+- `spec/gui_harness/live/protocol_handler_spec.rb` — the registration of the `ableton:` protocol
+- `assets/live/uac_snapshot.ps1` — the snapshot that shows what a version switch changes
 - `live_set/spec/integration/live_set_round_trip_spec.rb`,
   `live_set/spec/support/live_harness/live_launcher_spec.rb` — the new constant
-- `README.md`, `docs/gui_harness_design.md`, `live_set/docs/live_control_plan.md` — the docs
+- `README.md`, `docs/gui_harness_design.md`, `docs/elevation.md`, `live_set/docs/live_control_plan.md` — the docs
 
 ## Verification
 

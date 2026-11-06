@@ -388,9 +388,9 @@ bundle exec rspec \
 
 ## Testing philosophy
 
-This library has no mocks. It is built to validate real desktop behavior, real
-dialogs, and real app states. When the harness says a dialog is fatal, recovery,
-save-related, or an ordinary file error, it is because the real Windows UI
-exposed that text and the harness classified it as such.
+This library is not tested with mocks. It is built to validate real desktop
+behavior, real dialogs, and real app states. When the harness says a dialog is
+fatal, recovery, save-related, or an ordinary file error, it is because the real
+Windows UI exposed that text and the harness classified it as such.
 
 That is what makes it useful for debugging actual compatibility paths and crash-recovery flows.

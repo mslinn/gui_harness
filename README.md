@@ -6,7 +6,7 @@ testing.
 The design is in [docs/gui_harness_design.md](docs/gui_harness_design.md), and
 the implementation plan is in [docs/relayer_plan.md](docs/relayer_plan.md).
 
-## Purpose
+## Purpose: Automate GUI Applications
 
 `gui_harness` is a small library for driving GUI applications the way a user
 does: launch the program, inspect its windows, read the visible dialog text,
@@ -17,18 +17,24 @@ The process-owned window probe is the source of truth for the dialogs of the
 applications that expose readable text displayed in their windows.
 
 Ableton Live is a Qt application, so it does not expose names for its windows,
-which makes identifying what it is saying very difficult. The harness relies on
-other clues before attempting to screen scrape Qt windows, such as reading from
-the Live log and looking for crash files.
+which can make identifying what it is saying from context very difficult. The
+harness relies on other clues before attempting to screen scrape Qt windows.
+It is most efficient to read the Live log and to look for crash files before
+attempting screen scraping.
 
-The harness is designed for a WSL under Windows workflow: the Ruby code runs in
-WSL and write a PowerShell script in the Windows file system, then the
-PowerShell script launches the GUI program under Windows. The launcher script is
-treated as a deployed runtime asset.
+The harness is designed for running from WSL in support of a Windows 11-centric
+workflow: the Ruby code runs in WSL and write a PowerShell script into the
+Windows file system, then the PowerShell script launches the Windows-based GUI
+program (which might be some version of Ableton Live). The PowerShell launcher
+script is deployed at runtime by the Ruby code running in WSL and is not
+installed when this Ruby gem is installed.
+
+This project could readily be extended to support macOS.
 
 ## Project layout
 
-- `lib/` contains the Ruby API and domain logic, in a directory per layer
+- `lib/` contains the Ruby API and domain logic. The two architectural layers
+  (See the "Two Layers" section) are implemented in separate directories.
 - `assets/` contains runtime assets that are deployed with the gem, including the Windows
   PowerShell sidecar, in a directory per layer
 - `spec/` contains end-to-end, real-GUI regression tests, in a directory per layer
@@ -38,48 +44,61 @@ treated as a deployed runtime asset.
 ## Design Principles
 
 - Classify dialogs by visible text and expected user action
-- Prefer actual GUI state over synthetic parser assumptions
-- Examine STDOUT and STDERR output to help determine state
+- When required, examine STDOUT and STDERR output to help determine state
 - Keep the implementation reusable across desktop apps
 - Ableton Live requires an additional principle: Examine associated files to
   determine state
 
-### Two Layers
+### Two Architectural Layers
 
-The harness is implemented in two layers: a generic capability, and an Ableton
-Live specialization.
+The harness is implemented in two architectural layers: a generic capability,
+and an Ableton Live specialization.
 
 The generic layer can drive many GUI programs on Windows, such as Notepad. This
 layer launches the GUI program, enumerates the windows the program owns, walks
-the accessible tree for a visible modal dialog, reads the text the dialog
-exposes, classifies it, dismisses the modal dialog, and shuts the program down.
+the accessible tree of windows for visible modal dialogs, reads the text the dialogs
+expose, classifies them, dismisses the modal dialog, and shuts the program down.
 This layer knows nothing of any particular program.
 
-The Live layer modifies and enhances the generic layer to support Ableton Live.
-Live saves many messages displayed in its dialogs in the Live log. For example,
-a clean exit is apparent by examining the Live log. However, Live is a Qt
-application and exposes no names for its windows, so detecting and handling
-problems requires screen scraping techniques.
+The Live layer modifies and enhances the generic layer to support Ableton Live
+versions 8 through 12. Live writes many (but not all) messages displayed in its
+dialogs in the Live log. For example, a clean exit is readily apparent by
+examining the Live log.
+
+HoweverThings get more complicated for dialogs that Live does not log.  Scraping
+text from Live dialogs is problematic because Live is a Qt application and
+exposes no names for its windows. Sometimes this means that detecting and
+handling problems requires OCR.
+
+OCR under Ruby is not as reliable as one might hope. We might have to look into
+better techniques one day if this problem becomes a blocker. Right now, all
+tests pass and the harness is fullfilling its tasks so we have no motivation to
+improve anything.
 
 ### Two Code Bases
 
 There two code bases, one written in Ruby and the other written in PowerShell.
 
-#### Ruby
+Each layer has a library of functions and an entry point that holds the
+parameters of the run. The Live library loads the generic library and redefines
+the seams between them.
+
+#### Ruby Code Base
 
 Generic layer: `lib/gui_harness/generic/`
 
 Ableton Live Layer: `lib/gui_harness/live/`
 
-#### PowerShell
+#### PowerShell Code Base
+
+This code is referred to as "the sidecar" because it is installs Windows file(s)
+at when a Ruby program runs under WSL. The PowerShell code is carried along for
+the ride, so to speak.
 
 Generic Layer: `assets/generic/`
 
 Ableton Live Layer: `assets/live/`
 
-Each layer has a library of functions and an entry point that holds the
-parameters of the run. The Live library loads the generic library and redefines
-the seams between them.
 
 ### Generic Layer
 
@@ -97,9 +116,10 @@ The generic layer is responsible for the following:
 ### Live Layer
 
 The Ableton Live layer enhances and modifies the generic layer to support
-running Ableton Live in a harness:
+running Ableton Live versions 8.4 to 12.x in a harness:
 
-- Saves any pre-existing `Options.txt`, then recreates it for each run. The
+- Saves any pre-existing `Options.txt`, then overwrites the file with settings
+  useful for the current run. The
   saved copy is restored to its previous state after each run. See
   `$live_set/docs/als_work.md` for more information.
 
@@ -110,6 +130,8 @@ TODO document the other high-level responsibilities currently implemented by the
 
 - No stubs, mocks, or simulations allowed
 - Retain a simple result model for tests
+- Use [`$live_reference_sets`](https://github.com/mslinn/live_reference_sets) as
+  the source of Ableton Live sets for testing purposes
 
 ## API
 
@@ -117,11 +139,13 @@ The entry point for the generic layer is `GuiHarness::Generic::Launcher`; it
 drives simple GUI programs on Windows such as Notepad.  The entry point for
 Ableton Live is `GuiHarness::Live::Launcher`.
 
+TODO update the following code example
+
 ```ruby
 require 'gui_harness'
 
 result = GuiHarness::Live::Launcher.launch(
-  'C:/Program Files/Ableton/Live 12 Suite/Program/Ableton Live 12 Suite.exe',
+  'C:/ProgramData/Ableton/Live 12 Suite/Program/Ableton Live 12 Suite.exe',
   'C:/path/to/test.als',
   timeout: 13
 )
@@ -170,17 +194,27 @@ status; if a problem was encountered that could not be handled then the
 ## Closing GUI Applications
 
 An application running under the harness is shut down in stages ("rungs of a
-ladder"), and each layer has its own shutdown ladder. The Ruby code defines the
-order of the rungs, and the PowerShell code defines what each rung does. The
-launcher hands the rungs of its layer to the sidecar, and the sidecar climbs them.
+ladder", actually a state machine with one path and no conditional branching,
+just conditional exits), and each layer has its own shutdown ladder/state
+machine. The Ruby code defines the order of the rungs/states, and the PowerShell
+sidecar defines what each rung/state does. The launcher hands the rungs/states
+of its layer to the sidecar, and the sidecar climbs them until it encounters a
+matching condition to exit on.
 
-The generic ladder:
+### Closing Via The Generic Ladder / State Machine
 
 1. `close_windows` — ask the application to close, the way a person closes it.
 2. `wait_for_exit` — wait for the process tree to go away by itself.
 3. `stop_tree` — stop what is left, as the last resort.
 
-The Live ladder:
+The generic layer waits five seconds for applications to close. Applications
+that close by themselves return a `true` value for `exited_cleanly`.
+
+Aapplications that do not close are forcefully stopped, which means crash
+exits.  Applications that are forcefully stopped return a `false` value for
+`exited_cleanly`.
+
+### Closing Via The Live Ladder / State Machine
 
 1. `close_windows`
 2. `answer_save_prompt` — answer Live's "Save changes?" from Live's log: `No`,
@@ -189,18 +223,12 @@ The Live ladder:
 4. `confirm_clean_exit` — Live's log says it quit normally.
 5. `stop_tree`
 
-The generic layer waits five seconds for the application to close. An
-application that closes by itself has exited cleanly, and `exited_cleanly` is
-`true`.
-
-An application that does not close is forcefully stopped, and `exited_cleanly`
-is `false`. Stop are abrupt: the application does not get to save the document
-it was working on. Live leaves a crash report behind and will ask to recover its
-work on the next start. A clean exit is therefore the difference between a
-harness run that leaves nothing behind and one that does.
-
+Live leaves a crash report behind and will ask to recover its work the next time
+it starts.
 
 ## Ableton Live Layer
+
+The following sections describe additional functionality provided by the Live layer.
 
 ### Pending Updates
 
@@ -360,8 +388,9 @@ bundle exec rspec \
 
 ## Testing philosophy
 
-This library is not a mock-based parser. It is built to validate real desktop behavior, real dialogs, and real app
-states. When the harness says a dialog is fatal, recovery, save-related, or an ordinary file error, it is because the
-real Windows UI exposed that text and the harness classified it as such.
+This library has no mocks. It is built to validate real desktop behavior, real
+dialogs, and real app states. When the harness says a dialog is fatal, recovery,
+save-related, or an ordinary file error, it is because the real Windows UI
+exposed that text and the harness classified it as such.
 
 That is what makes it useful for debugging actual compatibility paths and crash-recovery flows.

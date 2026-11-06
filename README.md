@@ -1,14 +1,30 @@
-# gui_harness [![Gem Version](https://badge.fury.io/rb/gui_harness.svg)](https://badge.fury.io/rb/gui_harness)
+# `gui_harness` [![Gem Version](https://badge.fury.io/rb/gui_harness.svg)](https://badge.fury.io/rb/gui_harness)
 
-A Ruby harness for real GUI automation and end-to-end compatibility testing.
+A Ruby/PowerShell harness for GUI automation and end-to-end compatibility
+testing.
+
+The design is in [docs/gui_harness_design.md](docs/gui_harness_design.md), and
+the implementation plan is in [docs/relayer_plan.md](docs/relayer_plan.md).
 
 ## Purpose
 
-`gui_harness` is a small library for driving real desktop applications the way a user does: launch the actual process, inspect the windows it owns, read the visible dialog text, classify the modal state, dismiss the blocking prompt, and return a structured result for tests.
+`gui_harness` is a small library for driving GUI applications the way a user
+does: launch the program, inspect its windows, read the visible dialog text,
+classify the modal state, dismiss any blocking prompts, and return a structured
+result for tests.
 
-This project is intentionally not a log-only parser. The process-owned window probe is the source of truth for the dialogs of the applications that expose their windows; the dialogs of Live are read from Live's own log, because Live is a Qt application and exposes no names for its windows. The harness treats the UI as the contract, and says so where the UI says nothing.
+The process-owned window probe is the source of truth for the dialogs of the
+applications that expose readable text displayed in their windows.
 
-The harness is designed for the real WSL-to-Windows workflow: Ruby runs in WSL, then the target GUI is launched by PowerShell on Windows. The launcher script is treated as a deployed runtime asset, not as Ruby source code.
+Ableton Live is a Qt application, so it does not expose names for its windows,
+which makes identifying what it is saying very difficult. The harness relies on
+other clues before attempting to screen scrape Qt windows, such as reading from
+the Live log and looking for crash files.
+
+The harness is designed for a WSL under Windows workflow: the Ruby code runs in
+WSL and write a PowerShell script in the Windows file system, then the
+PowerShell script launches the GUI program under Windows. The launcher script is
+treated as a deployed runtime asset.
 
 ## Project layout
 
@@ -19,54 +35,66 @@ The harness is designed for the real WSL-to-Windows workflow: Ruby runs in WSL, 
 - `docs/` contains the design of the harness and the plan of the work
 - `.vscode/launch.json` contains editor launch entries for the real harness flow
 
-## The two layers
+## Design Principles
 
-The harness is in two layers: a generic capability, and an Ableton Live
-specialization.
+- Classify dialogs by visible text and expected user action
+- Prefer actual GUI state over synthetic parser assumptions
+- Examine STDOUT and STDERR output to help determine state
+- Keep the implementation reusable across desktop apps
+- Ableton Live requires an additional principle: Examine associated files to
+  determine state
 
-The generic layer drives any GUI program on Windows. It launches the program,
-enumerates the windows the program owns, walks the accessibility tree for a
-visible modal, reads the text the dialog exposes, classifies it, dismisses it,
-and shuts the program down. It knows nothing of any one program.
+### Two Layers
 
-The Live layer adds what is particular to Live: Live's own log is where its
-dialogs are read, because Live is a Qt application and exposes no names for its
-windows; Live's recovery prompt and its installer prompt are handled there; and
-Live's way of being closed — answering "Save changes?" and confirming the clean
-exit from Live's log — is there too.
+The harness is implemented in two layers: a generic capability, and an Ableton
+Live specialization.
 
-The layers are separate directories, so that the two can be read apart:
+The generic layer can drive many GUI programs on Windows, such as Notepad. This
+layer launches the GUI program, enumerates the windows the program owns, walks
+the accessible tree for a visible modal dialog, reads the text the dialog
+exposes, classifies it, dismisses the modal dialog, and shuts the program down.
+This layer knows nothing of any particular program.
 
-| Language   | Generic Layer              | Ableton Live Layer      |
-|------------|----------------------------|-------------------------|
-| Ruby       | `lib/gui_harness/generic/` | `lib/gui_harness/live/` |
-| PowerShell | `assets/generic/`          | `assets/live/`          |
+The Live layer modifies and enhances the generic layer to support Ableton Live.
+Live saves many messages displayed in its dialogs in the Live log. For example,
+a clean exit is apparent by examining the Live log. However, Live is a Qt
+application and exposes no names for its windows, so detecting and handling
+problems requires screen scraping techniques.
+
+### Two Code Bases
+
+There two code bases, one written in Ruby and the other written in PowerShell.
+
+#### Ruby
+
+Generic layer: `lib/gui_harness/generic/`
+
+Ableton Live Layer: `lib/gui_harness/live/`
+
+#### PowerShell
+
+Generic Layer: `assets/generic/`
+
+Ableton Live Layer: `assets/live/`
 
 Each layer has a library of functions and an entry point that holds the
-parameters of the run: `assets/generic/gui_harness_generic.ps1` and
-`assets/generic/run.ps1`, and `assets/live/gui_harness_live.ps1` and
-`assets/live/run.ps1`. The Live library loads the generic library and redefines
+parameters of the run. The Live library loads the generic library and redefines
 the seams between them.
 
-The design is in [docs/gui_harness_design.md](docs/gui_harness_design.md), and
-the implementation plan is in
-[docs/relayer_plan.md](docs/relayer_plan.md).
-
-
-## Generic Layer
+### Generic Layer
 
 The generic layer is responsible for the following:
 
-- launch a GUI executable
-- retain the process identity
-- enumerate the top-level windows owned by that process
-- walk the accessibility tree for a visible modal
-- read text exposed by the dialog
-- map the text to a known class of dialog
-- trigger the correct dismissal action
-- return a machine-readable outcome for the test harness
+- Launching a GUI executable
+- Retaining the process identity
+- Enumerating the top-level windows owned by that process
+- Walking the accessibility tree for a visible modal
+- Reading text exposed by the dialog
+- Mapping the text to a known class of dialog
+- Triggering the correct dismissal action
+- Returning a machine-readable outcome for the test harness
 
-## Live Layer
+### Live Layer
 
 The Ableton Live layer enhances and modifies the generic layer to support
 running Ableton Live in a harness:
@@ -78,21 +106,9 @@ running Ableton Live in a harness:
 TODO document the other high-level responsibilities currently implemented by the Live layer.
 
 
-## Generic Design Principles
-
-- Classify dialogs by visible text and expected user action
-- Prefer actual GUI state over synthetic parser assumptions
-- Examine STDOUT and STDERR output to help determine state
-- Keep the implementation reusable across desktop apps
-
-## Additional Principles for Ableton Live
-
-- Examine associated files to determine state
-
-
 ## Testing
 
-- No stubs, mocks, or simulations
+- No stubs, mocks, or simulations allowed
 - Retain a simple result model for tests
 
 ## API
